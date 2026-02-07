@@ -1,6 +1,6 @@
 const std = @import("std");
 
-/// Supported control-channel commands for Milestone 4.
+/// Supported control-channel commands for Milestone 5.
 pub const Command = enum {
     user,
     pass,
@@ -9,6 +9,9 @@ pub const Command = enum {
     syst,
     type_,
     feat,
+    pwd,
+    cwd,
+    cdup,
     unknown,
 };
 
@@ -43,6 +46,9 @@ fn parseCommand(cmd_text: []const u8) Command {
     if (std.ascii.eqlIgnoreCase(cmd_text, "SYST")) return .syst;
     if (std.ascii.eqlIgnoreCase(cmd_text, "TYPE")) return .type_;
     if (std.ascii.eqlIgnoreCase(cmd_text, "FEAT")) return .feat;
+    if (std.ascii.eqlIgnoreCase(cmd_text, "PWD")) return .pwd;
+    if (std.ascii.eqlIgnoreCase(cmd_text, "CWD")) return .cwd;
+    if (std.ascii.eqlIgnoreCase(cmd_text, "CDUP")) return .cdup;
     return .unknown;
 }
 
@@ -64,4 +70,10 @@ test "parse unknown for empty line" {
     const parsed = parse("");
     try testing.expectEqual(Command.unknown, parsed.command);
     try testing.expectEqual(@as(usize, 0), parsed.argument.len);
+}
+
+test "parse navigation commands" {
+    try testing.expectEqual(Command.pwd, parse("PWD").command);
+    try testing.expectEqual(Command.cwd, parse("CWD pub").command);
+    try testing.expectEqual(Command.cdup, parse("CDUP").command);
 }

@@ -1,0 +1,184 @@
+const std = @import("std");
+const interfaces_fs = @import("interfaces_fs.zig");
+
+/// In-memory mock filesystem focused on CWD/PWD behavior.
+pub const MockVfs = struct {
+    /// Current working directory state represented as an absolute path.
+    pub const Cwd = struct {
+        path: [128]u8 = [_]u8{0} ** 128,
+        len: usize = 1,
+
+        pub fn asSlice(self: *const Cwd) []const u8 {
+            return self.path[0..self.len];
+        }
+    };
+
+    pub const FileReader = struct {};
+    pub const FileWriter = struct {};
+    pub const DirIter = struct {};
+
+    /// Initialize to root (`/`).
+    pub fn cwdInit(_: *MockVfs) interfaces_fs.FsError!Cwd {
+        var cwd: Cwd = .{};
+        cwd.path[0] = '/';
+        cwd.len = 1;
+        return cwd;
+    }
+
+    /// Copy the current path to `out`.
+    pub fn cwdPwd(_: *MockVfs, cwd: *const Cwd, out: []u8) interfaces_fs.FsError![]const u8 {
+        if (out.len < cwd.len) return error.InvalidPath;
+        std.mem.copyForwards(u8, out[0..cwd.len], cwd.path[0..cwd.len]);
+        return out[0..cwd.len];
+    }
+
+    /// Change to `user_path` (absolute or relative).
+    pub fn cwdChange(_: *MockVfs, cwd: *Cwd, user_path: []const u8) interfaces_fs.FsError!void {
+        if (user_path.len == 0) return error.InvalidPath;
+        if (std.mem.indexOfScalar(u8, user_path, 0) != null) return error.InvalidPath;
+
+        if (std.mem.eql(u8, user_path, "locked") or std.mem.eql(u8, user_path, "/locked")) {
+            return error.PermissionDenied;
+        }
+        if (std.mem.eql(u8, user_path, "ioerr") or std.mem.eql(u8, user_path, "/ioerr")) {
+            return error.Io;
+        }
+
+        var next_path: [128]u8 = [_]u8{0} ** 128;
+        var next_len: usize = 0;
+
+        if (user_path[0] == '/') {
+            next_path[0] = '/';
+            next_len = 1;
+        } else {
+            std.mem.copyForwards(u8, next_path[0..cwd.len], cwd.path[0..cwd.len]);
+            next_len = cwd.len;
+        }
+
+        var i: usize = 0;
+        while (i < user_path.len) {
+            while (i < user_path.len and user_path[i] == '/') : (i += 1) {}
+            if (i >= user_path.len) break;
+            const start = i;
+            while (i < user_path.len and user_path[i] != '/') : (i += 1) {}
+            const segment = user_path[start..i];
+
+            if (std.mem.eql(u8, segment, ".")) continue;
+            if (std.mem.eql(u8, segment, "..")) {
+                if (next_len > 1) {
+                    var back = next_len - 1;
+                    while (back > 0 and next_path[back] != '/') : (back -= 1) {}
+                    next_len = if (back == 0) 1 else back;
+                }
+                continue;
+            }
+
+            if (std.mem.indexOfScalar(u8, segment, 0) != null) return error.InvalidPath;
+            if (segment.len == 0) continue;
+
+            if (next_len == 1 and next_path[0] == '/') {
+                if (next_len + segment.len > next_path.len) return error.InvalidPath;
+                std.mem.copyForwards(u8, next_path[next_len .. next_len + segment.len], segment);
+                next_len += segment.len;
+            } else {
+                if (next_len + 1 + segment.len > next_path.len) return error.InvalidPath;
+                next_path[next_len] = '/';
+                next_len += 1;
+                std.mem.copyForwards(u8, next_path[next_len .. next_len + segment.len], segment);
+                next_len += segment.len;
+            }
+        }
+
+        const normalized = next_path[0..next_len];
+        if (!isKnownDir(normalized)) {
+            if (isKnownFile(normalized)) return error.NotDir;
+            return error.NotFound;
+        }
+
+        std.mem.copyForwards(u8, cwd.path[0..next_len], normalized);
+        cwd.len = next_len;
+    }
+
+    /// Move one level up while staying rooted.
+    pub fn cwdUp(self: *MockVfs, cwd: *Cwd) interfaces_fs.FsError!void {
+        try self.cwdChange(cwd, "..");
+    }
+
+    pub fn dirOpen(_: *MockVfs, _: *const Cwd, _: ?[]const u8) interfaces_fs.FsError!DirIter {
+        return error.Unsupported;
+    }
+
+    pub fn dirNext(_: *MockVfs, _: *DirIter) interfaces_fs.FsError!?interfaces_fs.DirEntry {
+        return error.Unsupported;
+    }
+
+    pub fn dirClose(_: *MockVfs, _: *DirIter) void {}
+
+    pub fn openRead(_: *MockVfs, _: *const Cwd, _: []const u8) interfaces_fs.FsError!FileReader {
+        return error.Unsupported;
+    }
+
+    pub fn openWriteTrunc(_: *MockVfs, _: *const Cwd, _: []const u8) interfaces_fs.FsError!FileWriter {
+        return error.Unsupported;
+    }
+
+    pub fn readFile(_: *MockVfs, _: *FileReader, _: []u8) interfaces_fs.FsError!usize {
+        return error.Unsupported;
+    }
+
+    pub fn writeFile(_: *MockVfs, _: *FileWriter, _: []const u8) interfaces_fs.FsError!usize {
+        return error.Unsupported;
+    }
+
+    pub fn closeRead(_: *MockVfs, _: *FileReader) void {}
+
+    pub fn closeWrite(_: *MockVfs, _: *FileWriter) void {}
+
+    pub fn delete(_: *MockVfs, _: *const Cwd, _: []const u8) interfaces_fs.FsError!void {
+        return error.Unsupported;
+    }
+
+    pub fn rename(_: *MockVfs, _: *const Cwd, _: []const u8, _: []const u8) interfaces_fs.FsError!void {
+        return error.Unsupported;
+    }
+
+    fn isKnownDir(path: []const u8) bool {
+        return std.mem.eql(u8, path, "/") or
+            std.mem.eql(u8, path, "/pub") or
+            std.mem.eql(u8, path, "/pub/nested") or
+            std.mem.eql(u8, path, "/docs");
+    }
+
+    fn isKnownFile(path: []const u8) bool {
+        return std.mem.eql(u8, path, "/readme.txt");
+    }
+};
+
+const testing = std.testing;
+
+test "mock vfs resolves cwd transitions" {
+    var vfs: MockVfs = .{};
+    var cwd = try vfs.cwdInit();
+
+    try vfs.cwdChange(&cwd, "pub");
+    try testing.expect(std.mem.eql(u8, "/pub", cwd.asSlice()));
+
+    try vfs.cwdChange(&cwd, "nested");
+    try testing.expect(std.mem.eql(u8, "/pub/nested", cwd.asSlice()));
+
+    try vfs.cwdUp(&cwd);
+    try testing.expect(std.mem.eql(u8, "/pub", cwd.asSlice()));
+
+    try vfs.cwdChange(&cwd, "/docs");
+    try testing.expect(std.mem.eql(u8, "/docs", cwd.asSlice()));
+}
+
+test "mock vfs reports known navigation errors" {
+    var vfs: MockVfs = .{};
+    var cwd = try vfs.cwdInit();
+
+    try testing.expectError(error.NotFound, vfs.cwdChange(&cwd, "missing"));
+    try testing.expectError(error.NotDir, vfs.cwdChange(&cwd, "/readme.txt"));
+    try testing.expectError(error.PermissionDenied, vfs.cwdChange(&cwd, "locked"));
+    try testing.expectError(error.Io, vfs.cwdChange(&cwd, "ioerr"));
+}

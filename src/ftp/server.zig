@@ -6,8 +6,9 @@ const replies = @import("replies.zig");
 const commands = @import("commands.zig");
 const session_mod = @import("session.zig");
 const misc = @import("misc.zig");
+const mock_vfs = @import("mock_vfs.zig");
 
-/// Single-session FTP server core for Milestone 4.
+/// Single-session FTP server core for Milestone 5.
 pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
     interfaces_net.validate(Net);
     interfaces_fs.validate(Fs);
@@ -24,6 +25,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
         line_reader: control.LineReader(Net),
         reply_writer: replies.ReplyWriter(Net),
         session: *session_mod.Session,
+        cwd: ?Fs.Cwd = null,
 
         pub fn initNoHeap(
             net: *Net,
@@ -48,7 +50,6 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
         /// Drive one bounded, non-blocking server tick.
         pub fn tick(self: *Self, now_millis: u64) interfaces_net.NetError!void {
             _ = now_millis;
-            _ = self.fs;
 
             if (self.control_conn == null) {
                 try self.acceptPrimaryConn();
@@ -95,6 +96,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
 
             self.control_conn = maybe_conn.?;
             self.session.* = .{};
+            self.cwd = null;
             self.line_reader = control.LineReader(Net).init(self.storage.command_buf);
             self.reply_writer = replies.ReplyWriter(Net).init(self.storage.reply_buf);
             try self.queueLine(220, self.config.banner);
@@ -138,6 +140,9 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
                 .syst => try self.queueLine(215, "UNIX Type: L8"),
                 .type_ => try self.handleType(parsed.argument),
                 .feat => try self.queueFeat(),
+                .pwd => try self.handlePwd(),
+                .cwd => try self.handleCwd(parsed.argument),
+                .cdup => try self.handleCdup(),
                 .unknown => try self.queueLine(502, "Command not implemented"),
                 .quit => unreachable,
             }
@@ -180,10 +185,20 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
                             return;
                         }
                         if (std.mem.eql(u8, parsed.argument, self.config.password)) {
+                            self.cwd = self.fs.cwdInit() catch |err| {
+                                try self.queueFsError(err);
+                                self.session.auth_state = .NeedUser;
+                                self.session.cwd_ready = false;
+                                self.cwd = null;
+                                return;
+                            };
                             self.session.auth_state = .Authed;
+                            self.session.cwd_ready = true;
                             try self.queueLine(230, "User logged in");
                         } else {
                             self.session.auth_state = .NeedUser;
+                            self.session.cwd_ready = false;
+                            self.cwd = null;
                             try self.queueLine(530, "Not logged in");
                         }
                     },
@@ -214,11 +229,86 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
             self.reply_writer.queueLine(code, text) catch return error.Io;
         }
 
+        fn handlePwd(self: *Self) interfaces_net.NetError!void {
+            const cwd = self.requireCwd() orelse {
+                try self.queueLine(451, "Requested action aborted: local error in processing");
+                return;
+            };
+            const split = self.storage.scratch.len / 2;
+            if (split == 0) {
+                try self.queueLine(451, "Requested action aborted: local error in processing");
+                return;
+            }
+            const pwd = self.fs.cwdPwd(cwd, self.storage.scratch[0..split]) catch |err| {
+                try self.queueFsError(err);
+                return;
+            };
+            const msg = std.fmt.bufPrint(self.storage.scratch[split..], "\"{s}\"", .{pwd}) catch {
+                try self.queueLine(451, "Requested action aborted: local error in processing");
+                return;
+            };
+            try self.queueLine(257, msg);
+        }
+
+        fn handleCwd(self: *Self, arg: []const u8) interfaces_net.NetError!void {
+            const trimmed = std.mem.trim(u8, arg, " ");
+            if (trimmed.len == 0) {
+                try self.queueLine(501, "Syntax error in parameters or arguments");
+                return;
+            }
+
+            const cwd = self.requireCwd() orelse {
+                try self.queueLine(451, "Requested action aborted: local error in processing");
+                return;
+            };
+            self.fs.cwdChange(cwd, trimmed) catch |err| {
+                try self.queueFsError(err);
+                return;
+            };
+            try self.queueLine(250, "Directory successfully changed");
+        }
+
+        fn handleCdup(self: *Self) interfaces_net.NetError!void {
+            const cwd = self.requireCwd() orelse {
+                try self.queueLine(451, "Requested action aborted: local error in processing");
+                return;
+            };
+            self.fs.cwdUp(cwd) catch |err| {
+                try self.queueFsError(err);
+                return;
+            };
+            try self.queueLine(250, "Directory successfully changed");
+        }
+
+        fn requireCwd(self: *Self) ?*Fs.Cwd {
+            if (!self.session.cwd_ready) return null;
+            if (self.cwd == null) return null;
+            return &self.cwd.?;
+        }
+
+        fn queueFsError(self: *Self, err: interfaces_fs.FsError) interfaces_net.NetError!void {
+            const mapped = mapFsError(err);
+            try self.queueLine(mapped.code, mapped.text);
+        }
+
+        fn mapFsError(err: interfaces_fs.FsError) struct { code: u16, text: []const u8 } {
+            return switch (err) {
+                error.InvalidPath => .{ .code = 553, .text = "Requested action not taken. File name not allowed" },
+                error.NoSpace => .{ .code = 452, .text = "Insufficient storage space" },
+                error.Io => .{ .code = 451, .text = "Requested action aborted: local error in processing" },
+                error.PermissionDenied, error.ReadOnly => .{ .code = 550, .text = "Permission denied" },
+                error.NotFound => .{ .code = 550, .text = "File not found" },
+                error.Exists => .{ .code = 550, .text = "File exists" },
+                else => .{ .code = 550, .text = "Requested action not taken" },
+            };
+        }
+
         fn closeControlConn(self: *Self) void {
             if (self.control_conn) |*conn| {
                 self.net.closeConn(conn);
             }
             self.control_conn = null;
+            self.cwd = null;
             self.session.* = .{};
             self.line_reader = control.LineReader(Net).init(self.storage.command_buf);
             self.reply_writer = replies.ReplyWriter(Net).init(self.storage.reply_buf);
@@ -231,19 +321,24 @@ const limits = @import("limits.zig");
 const testing = std.testing;
 
 const MockFs = struct {
-    pub const Cwd = struct {};
+    pub const Cwd = mock_vfs.MockVfs.Cwd;
     pub const FileReader = struct {};
     pub const FileWriter = struct {};
     pub const DirIter = struct {};
+    vfs: mock_vfs.MockVfs = .{},
 
-    pub fn cwdInit(_: *MockFs) interfaces_fs.FsError!Cwd {
-        return .{};
+    pub fn cwdInit(self: *MockFs) interfaces_fs.FsError!Cwd {
+        return self.vfs.cwdInit();
     }
-    pub fn cwdPwd(_: *MockFs, _: *const Cwd, out: []u8) interfaces_fs.FsError![]const u8 {
-        return out[0..0];
+    pub fn cwdPwd(self: *MockFs, cwd: *const Cwd, out: []u8) interfaces_fs.FsError![]const u8 {
+        return self.vfs.cwdPwd(cwd, out);
     }
-    pub fn cwdChange(_: *MockFs, _: *Cwd, _: []const u8) interfaces_fs.FsError!void {}
-    pub fn cwdUp(_: *MockFs, _: *Cwd) interfaces_fs.FsError!void {}
+    pub fn cwdChange(self: *MockFs, cwd: *Cwd, path: []const u8) interfaces_fs.FsError!void {
+        try self.vfs.cwdChange(cwd, path);
+    }
+    pub fn cwdUp(self: *MockFs, cwd: *Cwd) interfaces_fs.FsError!void {
+        try self.vfs.cwdUp(cwd);
+    }
     pub fn dirOpen(_: *MockFs, _: *const Cwd, _: ?[]const u8) interfaces_fs.FsError!DirIter {
         return .{};
     }
@@ -350,4 +445,83 @@ test "server rejects second control connection with 421" {
     try testing.expectEqual(@as(usize, 2), net.closed_conn_len);
     try testing.expectEqual(@as(u16, 2), net.closed_conn_ids[0]);
     try testing.expectEqual(@as(u16, 1), net.closed_conn_ids[1]);
+}
+
+test "server handles PWD CWD and CDUP" {
+    var net: mock_net.MockNet = .{
+        .control_accept_script = &.{
+            .{ .conn = 1 },
+        },
+        .read_script = &.{
+            .{ .bytes = "USER test\r\nPASS secret\r\nPWD\r\nCWD pub\r\nPWD\r\nCDUP\r\nPWD\r\nQUIT\r\n" },
+        },
+    };
+    var fs: MockFs = .{};
+    const listener = try net.controlListen(.{});
+
+    var cmd_buf: [limits.command_max]u8 = undefined;
+    var reply_buf: [limits.reply_max]u8 = undefined;
+    var transfer_buf: [limits.transfer_max]u8 = undefined;
+    var scratch_buf: [limits.scratch_max]u8 = undefined;
+    var storage = misc.Storage.init(cmd_buf[0..], reply_buf[0..], transfer_buf[0..], scratch_buf[0..]);
+    storage.session = .{};
+
+    const Server = FtpServer(mock_net.MockNet, MockFs);
+    var server = Server.initNoHeap(&net, &fs, listener, .{
+        .user = "test",
+        .password = "secret",
+        .banner = "FTP Server Ready",
+    }, &storage);
+
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        try server.tick(0);
+    }
+
+    const expected =
+        "220 FTP Server Ready\r\n" ++
+        "331 User name okay, need password\r\n" ++
+        "230 User logged in\r\n" ++
+        "257 \"/\"\r\n" ++
+        "250 Directory successfully changed\r\n" ++
+        "257 \"/pub\"\r\n" ++
+        "250 Directory successfully changed\r\n" ++
+        "257 \"/\"\r\n" ++
+        "221 Bye\r\n";
+    try testing.expect(std.mem.eql(u8, expected, net.written()));
+}
+
+test "server maps CWD fs errors to replies" {
+    var net: mock_net.MockNet = .{
+        .control_accept_script = &.{
+            .{ .conn = 1 },
+        },
+        .read_script = &.{
+            .{ .bytes = "USER test\r\nPASS secret\r\nCWD missing\r\nCWD locked\r\nCWD ioerr\r\nQUIT\r\n" },
+        },
+    };
+    var fs: MockFs = .{};
+    const listener = try net.controlListen(.{});
+
+    var cmd_buf: [limits.command_max]u8 = undefined;
+    var reply_buf: [limits.reply_max]u8 = undefined;
+    var transfer_buf: [limits.transfer_max]u8 = undefined;
+    var scratch_buf: [limits.scratch_max]u8 = undefined;
+    var storage = misc.Storage.init(cmd_buf[0..], reply_buf[0..], transfer_buf[0..], scratch_buf[0..]);
+    storage.session = .{};
+
+    const Server = FtpServer(mock_net.MockNet, MockFs);
+    var server = Server.initNoHeap(&net, &fs, listener, .{
+        .user = "test",
+        .password = "secret",
+    }, &storage);
+
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        try server.tick(0);
+    }
+
+    try testing.expect(std.mem.indexOf(u8, net.written(), "550 File not found\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, net.written(), "550 Permission denied\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, net.written(), "451 Requested action aborted: local error in processing\r\n") != null);
 }

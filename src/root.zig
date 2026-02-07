@@ -16,5 +16,9 @@ pub const mock_net = @import("ftp/mock_net.zig");
 pub const commands = @import("ftp/commands.zig");
 /// FTP control-session state definitions.
 pub const session = @import("ftp/session.zig");
+/// FTP transfer module placeholders and helpers.
+pub const transfer = @import("ftp/transfer.zig");
 /// FTP server core state machine and tick driver.
 pub const server = @import("ftp/server.zig");
+/// In-memory mock filesystem for protocol tests.
+pub const mock_vfs = @import("ftp/mock_vfs.zig");
