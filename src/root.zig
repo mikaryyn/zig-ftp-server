@@ -6,3 +6,9 @@ pub const interfaces_net = @import("ftp/interfaces_net.zig");
 pub const interfaces_fs = @import("ftp/interfaces_fs.zig");
 /// Miscellaneous public API items for the server core.
 pub const misc = @import("ftp/misc.zig");
+/// Non-blocking control-channel line reader utilities.
+pub const control = @import("ftp/control.zig");
+/// Reply formatting and resumable write helpers.
+pub const replies = @import("ftp/replies.zig");
+/// Deterministic Net mock for protocol tests.
+pub const mock_net = @import("ftp/mock_net.zig");

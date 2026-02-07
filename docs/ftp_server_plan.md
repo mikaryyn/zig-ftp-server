@@ -15,7 +15,7 @@ This repository must also include a runnable CLI harness that wires the library 
 - [x] (2026-02-07 18:45Z) Record initial design decisions (below) and keep this plan updated during implementation.
 - [x] (2026-02-07 18:45Z) Milestone 1: Scaffolding + compile-time interfaces + first tests pass via `zig build test`.
 - [x] (2026-02-07 19:10Z) Milestone 2: Minimal CLI harness (`NetStd`) that accepts a control connection and closes (or sends a banner), proving the app runs.
-- [ ] Milestone 3: Control-channel CRLF line reader + reply writer (non-blocking) with unit tests.
+- [x] (2026-02-07 20:44Z) Milestone 3: Control-channel CRLF line reader + reply writer (non-blocking) with unit tests.
 - [ ] Milestone 4: Session state machine + auth + basic commands (`USER`, `PASS`, `QUIT`, `NOOP`, `SYST`, `TYPE`, `FEAT`) with mock-net tests.
 - [ ] Milestone 5: Fs interface usage + navigation commands (`PWD`, `CWD`, `CDUP`) with mock-fs tests.
 - [ ] Milestone 6: CLI harness (`NetStd` + `VfsOs`) wired to core + manual “login and PWD” smoke test.
@@ -58,6 +58,7 @@ This repository must also include a runnable CLI harness that wires the library 
 
 - Milestone 1 delivered the scaffolding: limits/constants, Net/Fs interface definitions with compile-time validation, a placeholder public API, and a passing `zig build test` with mock instantiation. Remaining work proceeds with control-channel I/O and state machine implementation.
 - Milestone 2 delivered a runnable CLI harness (`ftp-server`) with a minimal non-blocking listener/accept loop (`NetStd`) that accepts one connection, optionally writes a banner, and closes, proving the app can run and be smoke-tested with `nc`.
+- Milestone 3 delivered `src/ftp/control.zig` (non-blocking CRLF line reader with long-line discard), `src/ftp/replies.zig` (fixed-buffer reply formatter + resumable partial-writes), and `src/ftp/mock_net.zig` (deterministic partial I/O / `WouldBlock` scripts), with unit tests covering split CRLF, multi-line buffering, empty lines, long-line handling, FEAT formatting, and partial-write flushing.
 
 ## Context and Orientation
 
@@ -300,3 +301,4 @@ This project targets Zig 0.16 and uses no required heap allocation in the core l
 
 Plan Update Notes (2026-02-07): Marked Milestone 1 complete, recorded the Zig fingerprint mismatch discovery, and summarized Milestone 1 outcomes after landing the scaffolding and compile-time validation.
 Plan Update Notes (2026-02-07): Reordered milestones to deliver a minimal runnable CLI at Milestone 2, and renumbered subsequent milestones accordingly to prioritize early runnable deliverables.
+Plan Update Notes (2026-02-07): Completed Milestone 3 and added control/reply/mock-net modules with non-blocking unit coverage for boundary and partial-I/O cases.
