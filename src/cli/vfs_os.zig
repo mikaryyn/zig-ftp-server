@@ -17,7 +17,9 @@ pub const VfsOs = struct {
     pub const FileReader = struct {
         file: std.Io.File,
     };
-    pub const FileWriter = struct {};
+    pub const FileWriter = struct {
+        file: std.Io.File,
+    };
     pub const DirIter = struct {
         dir: std.Io.Dir,
         iter: std.Io.Dir.Iterator,
@@ -127,23 +129,36 @@ pub const VfsOs = struct {
         return .{ .file = file };
     }
 
-    pub fn openWriteTrunc(_: *VfsOs, _: *const Cwd, _: []const u8) interfaces_fs.FsError!FileWriter {
-        return error.Unsupported;
+    pub fn openWriteTrunc(self: *VfsOs, cwd: *const Cwd, user_path: []const u8) interfaces_fs.FsError!FileWriter {
+        var target_buf: [max_path_len]u8 = undefined;
+        const target = try normalizePath(cwd, user_path, target_buf[0..]);
+
+        var rel_buf: [max_path_len]u8 = undefined;
+        const rel_path = try toRelative(target, rel_buf[0..]);
+
+        const file = self.root_dir.createFile(self.io, rel_path, .{
+            .read = false,
+            .truncate = true,
+        }) catch |err| return mapFsError(err);
+
+        return .{ .file = file };
     }
 
     pub fn readFile(self: *VfsOs, reader: *FileReader, out: []u8) interfaces_fs.FsError!usize {
         return reader.file.readStreaming(self.io, &.{out}) catch |err| mapFsError(err);
     }
 
-    pub fn writeFile(_: *VfsOs, _: *FileWriter, _: []const u8) interfaces_fs.FsError!usize {
-        return error.Unsupported;
+    pub fn writeFile(self: *VfsOs, writer: *FileWriter, src: []const u8) interfaces_fs.FsError!usize {
+        return self.io.vtable.fileWriteStreaming(self.io.userdata, writer.file, &.{}, &.{src}, 1) catch |err| mapFsError(err);
     }
 
     pub fn closeRead(self: *VfsOs, reader: *FileReader) void {
         reader.file.close(self.io);
     }
 
-    pub fn closeWrite(_: *VfsOs, _: *FileWriter) void {}
+    pub fn closeWrite(self: *VfsOs, writer: *FileWriter) void {
+        writer.file.close(self.io);
+    }
 
     pub fn delete(_: *VfsOs, _: *const Cwd, _: []const u8) interfaces_fs.FsError!void {
         return error.Unsupported;

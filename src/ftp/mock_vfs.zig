@@ -3,6 +3,12 @@ const interfaces_fs = @import("interfaces_fs.zig");
 
 /// In-memory mock filesystem focused on CWD/PWD behavior.
 pub const MockVfs = struct {
+    uploaded_path: [128]u8 = [_]u8{0} ** 128,
+    uploaded_path_len: usize = 0,
+    uploaded_bytes: [1024]u8 = [_]u8{0} ** 1024,
+    uploaded_len: usize = 0,
+    write_chunk_limit: usize = std.math.maxInt(usize),
+
     /// Current working directory state represented as an absolute path.
     pub const Cwd = struct {
         path: [128]u8 = [_]u8{0} ** 128,
@@ -147,8 +153,19 @@ pub const MockVfs = struct {
         return error.NotFound;
     }
 
-    pub fn openWriteTrunc(_: *MockVfs, _: *const Cwd, _: []const u8) interfaces_fs.FsError!FileWriter {
-        return error.Unsupported;
+    pub fn openWriteTrunc(self: *MockVfs, cwd: *const Cwd, user_path: []const u8) interfaces_fs.FsError!FileWriter {
+        var path_buf: [128]u8 = undefined;
+        const path = try resolveFilePath(cwd, user_path, path_buf[0..]);
+
+        if (std.mem.eql(u8, path, "/locked-upload.bin")) return error.PermissionDenied;
+        if (std.mem.eql(u8, path, "/ioerr-upload.bin")) return error.Io;
+        if (isKnownDir(path)) return error.IsDir;
+
+        if (path.len > self.uploaded_path.len) return error.InvalidPath;
+        std.mem.copyForwards(u8, self.uploaded_path[0..path.len], path);
+        self.uploaded_path_len = path.len;
+        self.uploaded_len = 0;
+        return .{};
     }
 
     pub fn readFile(_: *MockVfs, reader: *FileReader, out: []u8) interfaces_fs.FsError!usize {
@@ -160,8 +177,17 @@ pub const MockVfs = struct {
         return n;
     }
 
-    pub fn writeFile(_: *MockVfs, _: *FileWriter, _: []const u8) interfaces_fs.FsError!usize {
-        return error.Unsupported;
+    pub fn writeFile(self: *MockVfs, _: *FileWriter, src: []const u8) interfaces_fs.FsError!usize {
+        if (src.len == 0) return 0;
+        if (self.uploaded_len >= self.uploaded_bytes.len) return error.NoSpace;
+
+        const remaining = self.uploaded_bytes.len - self.uploaded_len;
+        const n = @min(@min(src.len, remaining), self.write_chunk_limit);
+        if (n == 0) return error.NoSpace;
+
+        std.mem.copyForwards(u8, self.uploaded_bytes[self.uploaded_len .. self.uploaded_len + n], src[0..n]);
+        self.uploaded_len += n;
+        return n;
     }
 
     pub fn closeRead(_: *MockVfs, _: *FileReader) void {}
@@ -306,4 +332,18 @@ test "mock vfs openRead streams deterministic file bytes" {
     try testing.expect(std.mem.eql(u8, "mock-readme-bytes\n", buf[0 .. n1 + n2]));
 
     try testing.expectEqual(@as(usize, 0), try vfs.readFile(&reader, buf[0..]));
+}
+
+test "mock vfs openWriteTrunc and writeFile capture uploaded bytes" {
+    var vfs: MockVfs = .{};
+    var cwd = try vfs.cwdInit();
+
+    var writer = try vfs.openWriteTrunc(&cwd, "upload.bin");
+    defer vfs.closeWrite(&writer);
+
+    try testing.expectEqual(@as(usize, 6), try vfs.writeFile(&writer, "hello "));
+    try testing.expectEqual(@as(usize, 5), try vfs.writeFile(&writer, "world"));
+
+    try testing.expect(std.mem.eql(u8, "/upload.bin", vfs.uploaded_path[0..vfs.uploaded_path_len]));
+    try testing.expect(std.mem.eql(u8, "hello world", vfs.uploaded_bytes[0..vfs.uploaded_len]));
 }
