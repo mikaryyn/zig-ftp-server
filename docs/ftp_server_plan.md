@@ -19,7 +19,7 @@ This repository must also include a runnable CLI harness that wires the library 
 - [x] (2026-02-07 20:53Z) Milestone 4: Session state machine + auth + basic commands (`USER`, `PASS`, `QUIT`, `NOOP`, `SYST`, `TYPE`, `FEAT`) with mock-net tests.
 - [x] (2026-02-07 21:03Z) Milestone 5: Fs interface usage + navigation commands (`PWD`, `CWD`, `CDUP`) with mock-fs tests.
 - [x] (2026-02-07 22:05Z) Milestone 6: CLI harness (`NetStd` + `VfsOs`) wired to core + manual “login and PWD” smoke test.
-- [ ] Milestone 7: PASV lifecycle + data accept plumbing + `PASV` command with tests and manual smoke test.
+- [x] (2026-02-07 22:32Z) Milestone 7: PASV lifecycle + data accept plumbing + `PASV` command with tests and manual smoke test.
 - [ ] Milestone 8: `LIST` streaming implementation with tests and manual smoke test.
 - [ ] Milestone 9: `RETR` streaming download with tests and manual smoke test.
 - [ ] Milestone 10: `STOR` streaming upload with tests and manual smoke test.
@@ -61,6 +61,10 @@ This repository must also include a runnable CLI harness that wires the library 
   Rationale: `504` clearly indicates command support exists but specific parameters are unsupported, which is more precise than a generic syntax error.
   Date/Author: 2026-02-07 / Codex
 
+- Decision: Before Milestones 8–10 land transfer implementations, `LIST`/`RETR`/`STOR` return `425 Use PASV first` when no passive listener exists and `502 Command not implemented` once PASV is prepared.
+  Rationale: This enforces the sequencing rule now while making unsupported transfer execution explicit after PASV setup.
+  Date/Author: 2026-02-07 / Codex
+
 ## Outcomes & Retrospective
 
 - Milestone 1 delivered the scaffolding: limits/constants, Net/Fs interface definitions with compile-time validation, a placeholder public API, and a passing `zig build test` with mock instantiation. Remaining work proceeds with control-channel I/O and state machine implementation.
@@ -69,6 +73,7 @@ This repository must also include a runnable CLI harness that wires the library 
 - Milestone 4 delivered `src/ftp/commands.zig`, `src/ftp/session.zig`, and `src/ftp/server.zig` with a non-blocking single-session `tick()` driver implementing `USER`, `PASS`, `QUIT`, `NOOP`, `SYST`, `TYPE`, and `FEAT`; `src/ftp/mock_net.zig` was extended with scripted control accepts so tests now cover full login command sequencing and `421` rejection of concurrent control connections.
 - Milestone 5 delivered `PWD`/`CWD`/`CDUP` wired to `Fs.cwdPwd`/`Fs.cwdChange`/`Fs.cwdUp`, session CWD initialization during login, `src/ftp/mock_vfs.zig` in-memory navigation tests, `src/ftp/transfer.zig` placeholder state, and validated VFS error-to-reply mapping (`550`/`553`/`451`) under `zig build test`.
 - Milestone 6 delivered a full CLI harness wired to the protocol core: `src/cli/main.zig` now runs the `FtpServer` tick loop with `--listen`/`--root`/`--user`/`--pass`, `src/cli/net_std.zig` satisfies the compile-time `Net` interface for control-channel operation using non-blocking `std.net`, and `src/cli/vfs_os.zig` provides a rooted OS-backed `Fs` implementation for `cwd` operations with path normalization and NUL-byte rejection. Manual smoke validation with `./zig-out/bin/ftp-server` + `nc` confirmed the expected `220`/`331`/`230`/`257`/`221` sequence.
+- Milestone 7 delivered `src/ftp/pasv.zig` state definitions, session/server passive lifecycle wiring, `PASV` command support with `227` tuple formatting through the `Net` abstraction, passive accept polling (`PasvListening`→`DataConnected`), and mock-net tests proving repeated `PASV` closes prior listener/connection plus `425` enforcement for `LIST`/`RETR`/`STOR` without PASV.
 
 ## Context and Orientation
 
@@ -315,3 +320,4 @@ Plan Update Notes (2026-02-07): Completed Milestone 3 and added control/reply/mo
 Plan Update Notes (2026-02-07): Completed Milestone 4 by adding command parsing, session/auth state, and a non-blocking server tick with tests for login sequencing and second-connection `421` refusal.
 Plan Update Notes (2026-02-07): Completed Milestone 5 by adding filesystem-backed navigation commands (`PWD`, `CWD`, `CDUP`), in-memory mock VFS coverage, and reply mapping tests for filesystem errors.
 Plan Update Notes (2026-02-07): Completed Milestone 6 by wiring the real CLI harness (`main` + `NetStd` + rooted `VfsOs`) to the core server, fixing Zig 0.15.2 compatibility issues in argument/module wiring, and validating a manual login+PWD smoke test transcript.
+Plan Update Notes (2026-02-07): Completed Milestone 7 by adding PASV session lifecycle state, `PASV` command/reply plumbing, `Net` PASV tuple formatting support, passive accept tracking, and tests for repeated PASV cleanup plus `425 Use PASV first` transfer gating.

@@ -26,6 +26,8 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
         reply_writer: replies.ReplyWriter(Net),
         session: *session_mod.Session,
         cwd: ?Fs.Cwd = null,
+        pasv_listener: ?Net.PasvListener = null,
+        data_conn: ?Net.Conn = null,
 
         pub fn initNoHeap(
             net: *Net,
@@ -58,6 +60,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
             }
 
             try self.flushReplies();
+            try self.pollPasvAccept();
 
             if (self.control_conn == null) return;
             if (self.reply_writer.isPending()) return;
@@ -97,6 +100,8 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
             self.control_conn = maybe_conn.?;
             self.session.* = .{};
             self.cwd = null;
+            self.pasv_listener = null;
+            self.data_conn = null;
             self.line_reader = control.LineReader(Net).init(self.storage.command_buf);
             self.reply_writer = replies.ReplyWriter(Net).init(self.storage.reply_buf);
             try self.queueLine(220, self.config.banner);
@@ -140,6 +145,8 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
                 .syst => try self.queueLine(215, "UNIX Type: L8"),
                 .type_ => try self.handleType(parsed.argument),
                 .feat => try self.queueFeat(),
+                .pasv => try self.handlePasv(),
+                .list, .retr, .stor => try self.handleTransferCommand(),
                 .pwd => try self.handlePwd(),
                 .cwd => try self.handleCwd(parsed.argument),
                 .cdup => try self.handleCdup(),
@@ -221,6 +228,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
         fn queueFeat(self: *Self) interfaces_net.NetError!void {
             const features = [_][]const u8{
                 "TYPE I",
+                "PASV",
             };
             self.reply_writer.queueFeat(features[0..]) catch return error.Io;
         }
@@ -280,6 +288,74 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
             try self.queueLine(250, "Directory successfully changed");
         }
 
+        fn handlePasv(self: *Self) interfaces_net.NetError!void {
+            self.closePassiveResources();
+
+            const listener = self.net.pasvListen(.{}) catch {
+                self.session.pasv_state = .PasvIdle;
+                try self.queueLine(425, "Can't open data connection");
+                return;
+            };
+            self.pasv_listener = listener;
+            self.session.pasv_state = .PasvListening;
+
+            const addr = self.net.pasvLocalAddr(&self.pasv_listener.?) catch {
+                self.closePassiveResources();
+                try self.queueLine(425, "Can't open data connection");
+                return;
+            };
+
+            const split = self.storage.scratch.len / 2;
+            if (split == 0) {
+                self.closePassiveResources();
+                try self.queueLine(451, "Requested action aborted: local error in processing");
+                return;
+            }
+            const tuple_buf = self.storage.scratch[0..split];
+            const msg_buf = self.storage.scratch[split..];
+
+            const tuple = Net.formatPasvAddress(&addr, tuple_buf) catch {
+                self.closePassiveResources();
+                try self.queueLine(425, "Can't open data connection");
+                return;
+            };
+            const msg = std.fmt.bufPrint(msg_buf, "Entering Passive Mode ({s})", .{tuple}) catch {
+                self.closePassiveResources();
+                try self.queueLine(451, "Requested action aborted: local error in processing");
+                return;
+            };
+            try self.queueLine(227, msg);
+        }
+
+        fn handleTransferCommand(self: *Self) interfaces_net.NetError!void {
+            if (self.session.pasv_state == .PasvIdle) {
+                try self.queueLine(425, "Use PASV first");
+                return;
+            }
+            try self.queueLine(502, "Command not implemented");
+        }
+
+        fn pollPasvAccept(self: *Self) interfaces_net.NetError!void {
+            if (self.session.pasv_state != .PasvListening) return;
+            if (self.pasv_listener == null) {
+                self.session.pasv_state = .PasvIdle;
+                return;
+            }
+            if (self.data_conn != null) return;
+
+            const maybe_data = self.net.acceptData(&self.pasv_listener.?) catch |err| switch (err) {
+                error.WouldBlock => return,
+                else => {
+                    self.closePassiveResources();
+                    return err;
+                },
+            };
+            if (maybe_data == null) return;
+
+            self.data_conn = maybe_data.?;
+            self.session.pasv_state = .DataConnected;
+        }
+
         fn requireCwd(self: *Self) ?*Fs.Cwd {
             if (!self.session.cwd_ready) return null;
             if (self.cwd == null) return null;
@@ -303,7 +379,21 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
             };
         }
 
+        fn closePassiveResources(self: *Self) void {
+            if (self.data_conn) |*conn| {
+                self.net.closeConn(conn);
+            }
+            self.data_conn = null;
+
+            if (self.pasv_listener) |*listener| {
+                self.net.closeListener(listener);
+            }
+            self.pasv_listener = null;
+            self.session.pasv_state = .PasvIdle;
+        }
+
         fn closeControlConn(self: *Self) void {
+            self.closePassiveResources();
             if (self.control_conn) |*conn| {
                 self.net.closeConn(conn);
             }
@@ -403,6 +493,7 @@ test "server handles login flow and basic commands" {
         "200 Type set to I\r\n" ++
         "211-Features:\r\n" ++
         " TYPE I\r\n" ++
+        " PASV\r\n" ++
         "211 End\r\n" ++
         "221 Bye\r\n";
     try testing.expect(std.mem.eql(u8, expected, net.written()));
@@ -445,6 +536,88 @@ test "server rejects second control connection with 421" {
     try testing.expectEqual(@as(usize, 2), net.closed_conn_len);
     try testing.expectEqual(@as(u16, 2), net.closed_conn_ids[0]);
     try testing.expectEqual(@as(u16, 1), net.closed_conn_ids[1]);
+}
+
+test "server PASV lifecycle closes prior listener and data conn" {
+    var net: mock_net.MockNet = .{
+        .control_accept_script = &.{
+            .{ .conn = 1 },
+        },
+        .data_accept_script = &.{
+            .{ .conn = 7 },
+        },
+        .read_script = &.{
+            .{ .bytes = "USER test\r\nPASS secret\r\nPASV\r\nPASV\r\nQUIT\r\n" },
+        },
+        .pasv_local_addr = .{
+            .ip = .{ 10, 11, 12, 13 },
+            .port = 2125,
+        },
+    };
+    var fs: MockFs = .{};
+    const listener = try net.controlListen(.{});
+
+    var cmd_buf: [limits.command_max]u8 = undefined;
+    var reply_buf: [limits.reply_max]u8 = undefined;
+    var transfer_buf: [limits.transfer_max]u8 = undefined;
+    var scratch_buf: [limits.scratch_max]u8 = undefined;
+    var storage = misc.Storage.init(cmd_buf[0..], reply_buf[0..], transfer_buf[0..], scratch_buf[0..]);
+    storage.session = .{};
+
+    const Server = FtpServer(mock_net.MockNet, MockFs);
+    var server = Server.initNoHeap(&net, &fs, listener, .{
+        .user = "test",
+        .password = "secret",
+    }, &storage);
+
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        try server.tick(0);
+    }
+
+    const expected_227 = "227 Entering Passive Mode (10,11,12,13,8,77)\r\n";
+    const written = net.written();
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, written, expected_227));
+
+    try testing.expectEqual(@as(usize, 2), net.closed_listener_len);
+    try testing.expectEqual(@as(usize, 2), net.closed_conn_len);
+    try testing.expectEqual(@as(u16, 7), net.closed_conn_ids[0]);
+    try testing.expectEqual(@as(u16, 1), net.closed_conn_ids[1]);
+}
+
+test "server requires PASV before LIST RETR STOR" {
+    var net: mock_net.MockNet = .{
+        .control_accept_script = &.{
+            .{ .conn = 1 },
+        },
+        .read_script = &.{
+            .{ .bytes = "USER test\r\nPASS secret\r\nLIST\r\nRETR file.bin\r\nSTOR upload.bin\r\nQUIT\r\n" },
+        },
+    };
+    var fs: MockFs = .{};
+    const listener = try net.controlListen(.{});
+
+    var cmd_buf: [limits.command_max]u8 = undefined;
+    var reply_buf: [limits.reply_max]u8 = undefined;
+    var transfer_buf: [limits.transfer_max]u8 = undefined;
+    var scratch_buf: [limits.scratch_max]u8 = undefined;
+    var storage = misc.Storage.init(cmd_buf[0..], reply_buf[0..], transfer_buf[0..], scratch_buf[0..]);
+    storage.session = .{};
+
+    const Server = FtpServer(mock_net.MockNet, MockFs);
+    var server = Server.initNoHeap(&net, &fs, listener, .{
+        .user = "test",
+        .password = "secret",
+    }, &storage);
+
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        try server.tick(0);
+    }
+
+    const written = net.written();
+    const expected = "425 Use PASV first\r\n";
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, written, expected));
 }
 
 test "server handles PWD CWD and CDUP" {

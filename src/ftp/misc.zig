@@ -125,6 +125,13 @@ const MockNet = struct {
         return .{};
     }
 
+    pub fn formatPasvAddress(_: *const Address, out: []u8) interfaces_net.NetError![]const u8 {
+        if (out.len < "127,0,0,1,8,73".len) return error.Io;
+        const tuple = "127,0,0,1,8,73";
+        @memcpy(out[0..tuple.len], tuple);
+        return out[0..tuple.len];
+    }
+
     pub fn acceptData(_: *PasvListener) interfaces_net.NetError!?Conn {
         return null;
     }

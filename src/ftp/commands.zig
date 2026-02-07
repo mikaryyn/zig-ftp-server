@@ -1,6 +1,6 @@
 const std = @import("std");
 
-/// Supported control-channel commands for Milestone 5.
+/// Supported control-channel commands for Milestone 7.
 pub const Command = enum {
     user,
     pass,
@@ -9,6 +9,10 @@ pub const Command = enum {
     syst,
     type_,
     feat,
+    pasv,
+    list,
+    retr,
+    stor,
     pwd,
     cwd,
     cdup,
@@ -46,6 +50,10 @@ fn parseCommand(cmd_text: []const u8) Command {
     if (std.ascii.eqlIgnoreCase(cmd_text, "SYST")) return .syst;
     if (std.ascii.eqlIgnoreCase(cmd_text, "TYPE")) return .type_;
     if (std.ascii.eqlIgnoreCase(cmd_text, "FEAT")) return .feat;
+    if (std.ascii.eqlIgnoreCase(cmd_text, "PASV")) return .pasv;
+    if (std.ascii.eqlIgnoreCase(cmd_text, "LIST")) return .list;
+    if (std.ascii.eqlIgnoreCase(cmd_text, "RETR")) return .retr;
+    if (std.ascii.eqlIgnoreCase(cmd_text, "STOR")) return .stor;
     if (std.ascii.eqlIgnoreCase(cmd_text, "PWD")) return .pwd;
     if (std.ascii.eqlIgnoreCase(cmd_text, "CWD")) return .cwd;
     if (std.ascii.eqlIgnoreCase(cmd_text, "CDUP")) return .cdup;
@@ -76,4 +84,12 @@ test "parse navigation commands" {
     try testing.expectEqual(Command.pwd, parse("PWD").command);
     try testing.expectEqual(Command.cwd, parse("CWD pub").command);
     try testing.expectEqual(Command.cdup, parse("CDUP").command);
+}
+
+test "parse pasv and transfer commands" {
+    try testing.expectEqual(Command.pasv, parse("PASV").command);
+    try testing.expectEqual(Command.list, parse("LIST").command);
+    try testing.expectEqual(Command.retr, parse("RETR file.txt").command);
+    try testing.expect(std.mem.eql(u8, "file.txt", parse("RETR file.txt").argument));
+    try testing.expectEqual(Command.stor, parse("STOR upload.bin").command);
 }

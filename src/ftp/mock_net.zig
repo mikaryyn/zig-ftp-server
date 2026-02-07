@@ -7,6 +7,10 @@ pub const MockNet = struct {
     control_accept_script: []const AcceptOp = &.{},
     control_accept_index: usize = 0,
 
+    /// Scripted PASV data-accept behavior consumed one entry per `acceptData` call.
+    data_accept_script: []const AcceptOp = &.{},
+    data_accept_index: usize = 0,
+
     /// Scripted read behavior consumed one entry per `read` call.
     read_script: []const ReadOp = &.{},
     read_index: usize = 0,
@@ -23,6 +27,13 @@ pub const MockNet = struct {
     closed_conn_ids: [64]u16 = undefined,
     closed_conn_len: usize = 0,
 
+    /// Captured PASV listener ids passed to `closeListener`.
+    closed_listener_ids: [64]u16 = undefined,
+    closed_listener_len: usize = 0,
+
+    next_pasv_listener_id: u16 = 100,
+    pasv_local_addr: Address = .{},
+
     /// Address type used by the mock.
     pub const Address = struct {
         ip: [4]u8 = .{ 127, 0, 0, 1 },
@@ -36,6 +47,7 @@ pub const MockNet = struct {
     /// Placeholder data listener type for PASV.
     pub const PasvListener = struct {
         owner: *MockNet,
+        id: u16 = 0,
     };
     /// Placeholder connection type.
     pub const Conn = struct {
@@ -95,18 +107,43 @@ pub const MockNet = struct {
     }
 
     pub fn pasvListen(self: *MockNet, _: interfaces_net.PasvBindHint(Address)) interfaces_net.NetError!PasvListener {
-        return .{ .owner = self };
+        const id = self.next_pasv_listener_id;
+        self.next_pasv_listener_id +%= 1;
+        return .{ .owner = self, .id = id };
     }
 
-    pub fn pasvLocalAddr(_: *PasvListener) interfaces_net.NetError!Address {
-        return .{};
+    pub fn pasvLocalAddr(listener: *PasvListener) interfaces_net.NetError!Address {
+        return listener.owner.pasv_local_addr;
     }
 
-    pub fn acceptData(_: *PasvListener) interfaces_net.NetError!?Conn {
-        return null;
+    pub fn formatPasvAddress(addr: *const Address, out: []u8) interfaces_net.NetError![]const u8 {
+        const p1: u16 = addr.port / 256;
+        const p2: u16 = addr.port % 256;
+        return std.fmt.bufPrint(out, "{d},{d},{d},{d},{d},{d}", .{
+            addr.ip[0], addr.ip[1], addr.ip[2], addr.ip[3], p1, p2,
+        }) catch error.Io;
     }
 
-    pub fn closeListener(_: *PasvListener) void {}
+    pub fn acceptData(listener: *PasvListener) interfaces_net.NetError!?Conn {
+        const self = listener.owner;
+        if (self.data_accept_index >= self.data_accept_script.len) {
+            return null;
+        }
+        const op = self.data_accept_script[self.data_accept_index];
+        self.data_accept_index += 1;
+        return switch (op) {
+            .conn => |id| .{ .id = id },
+            .none => null,
+            .would_block => error.WouldBlock,
+        };
+    }
+
+    pub fn closeListener(listener: *PasvListener) void {
+        const self = listener.owner;
+        if (self.closed_listener_len >= self.closed_listener_ids.len) return;
+        self.closed_listener_ids[self.closed_listener_len] = listener.id;
+        self.closed_listener_len += 1;
+    }
 
     pub fn read(self: *MockNet, _: *Conn, out: []u8) interfaces_net.NetError!usize {
         if (self.read_index >= self.read_script.len) {

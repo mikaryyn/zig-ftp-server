@@ -18,6 +18,8 @@ pub const commands = @import("ftp/commands.zig");
 pub const session = @import("ftp/session.zig");
 /// FTP transfer module placeholders and helpers.
 pub const transfer = @import("ftp/transfer.zig");
+/// PASV data-connection lifecycle state definitions.
+pub const pasv = @import("ftp/pasv.zig");
 /// FTP server core state machine and tick driver.
 pub const server = @import("ftp/server.zig");
 /// In-memory mock filesystem for protocol tests.

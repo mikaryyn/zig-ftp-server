@@ -38,12 +38,35 @@ pub const NetStd = struct {
         return .{ .stream = conn };
     }
 
-    pub fn pasvListen(_: *NetStd, _: interfaces_net.PasvBindHint(Address)) interfaces_net.NetError!PasvListener {
-        return error.Io;
+    pub fn pasvListen(self: *NetStd, hint: interfaces_net.PasvBindHint(Address)) interfaces_net.NetError!PasvListener {
+        var bind_addr = hint.control_local orelse net.IpAddress.parseLiteral("0.0.0.0:0") catch {
+            return error.AddrUnavailable;
+        };
+        switch (bind_addr) {
+            .ip4 => |*ip4| ip4.port = 0,
+            .ip6 => |*ip6| ip6.port = 0,
+        }
+        const server = bind_addr.listen(self.io, .{
+            .reuse_address = true,
+        }) catch |err| return mapNetError(err);
+        return .{ .server = server };
     }
 
-    pub fn pasvLocalAddr(_: *NetStd, _: *PasvListener) interfaces_net.NetError!Address {
-        return error.AddrUnavailable;
+    pub fn pasvLocalAddr(_: *NetStd, listener: *PasvListener) interfaces_net.NetError!Address {
+        return listener.server.socket.address;
+    }
+
+    pub fn formatPasvAddress(address: *const Address, out: []u8) interfaces_net.NetError![]const u8 {
+        return switch (address.*) {
+            .ip4 => |ip4| blk: {
+                const p1: u16 = ip4.port / 256;
+                const p2: u16 = ip4.port % 256;
+                break :blk std.fmt.bufPrint(out, "{d},{d},{d},{d},{d},{d}", .{
+                    ip4.bytes[0], ip4.bytes[1], ip4.bytes[2], ip4.bytes[3], p1, p2,
+                }) catch error.Io;
+            },
+            .ip6 => error.AddrUnavailable,
+        };
     }
 
     pub fn acceptData(self: *NetStd, listener: *PasvListener) interfaces_net.NetError!?Conn {

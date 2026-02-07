@@ -45,6 +45,7 @@ pub fn validate(comptime Net: type) void {
 
     if (!@hasDecl(Net, "pasvListen")) missing.fnDecl("pasvListen");
     if (!@hasDecl(Net, "pasvLocalAddr")) missing.fnDecl("pasvLocalAddr");
+    if (!@hasDecl(Net, "formatPasvAddress")) missing.fnDecl("formatPasvAddress");
     if (!@hasDecl(Net, "acceptData")) missing.fnDecl("acceptData");
     if (!@hasDecl(Net, "closeListener")) missing.fnDecl("closeListener");
 
