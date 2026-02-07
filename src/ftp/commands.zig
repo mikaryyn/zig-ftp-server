@@ -1,6 +1,6 @@
 const std = @import("std");
 
-/// Supported control-channel commands for Milestone 7.
+/// Supported control-channel commands.
 pub const Command = enum {
     user,
     pass,
@@ -16,6 +16,13 @@ pub const Command = enum {
     pwd,
     cwd,
     cdup,
+    dele,
+    rnfr,
+    rnto,
+    mkd,
+    rmd,
+    size,
+    mdtm,
     unknown,
 };
 
@@ -57,6 +64,13 @@ fn parseCommand(cmd_text: []const u8) Command {
     if (std.ascii.eqlIgnoreCase(cmd_text, "PWD")) return .pwd;
     if (std.ascii.eqlIgnoreCase(cmd_text, "CWD")) return .cwd;
     if (std.ascii.eqlIgnoreCase(cmd_text, "CDUP")) return .cdup;
+    if (std.ascii.eqlIgnoreCase(cmd_text, "DELE")) return .dele;
+    if (std.ascii.eqlIgnoreCase(cmd_text, "RNFR")) return .rnfr;
+    if (std.ascii.eqlIgnoreCase(cmd_text, "RNTO")) return .rnto;
+    if (std.ascii.eqlIgnoreCase(cmd_text, "MKD")) return .mkd;
+    if (std.ascii.eqlIgnoreCase(cmd_text, "RMD")) return .rmd;
+    if (std.ascii.eqlIgnoreCase(cmd_text, "SIZE")) return .size;
+    if (std.ascii.eqlIgnoreCase(cmd_text, "MDTM")) return .mdtm;
     return .unknown;
 }
 
@@ -92,4 +106,14 @@ test "parse pasv and transfer commands" {
     try testing.expectEqual(Command.retr, parse("RETR file.txt").command);
     try testing.expect(std.mem.eql(u8, "file.txt", parse("RETR file.txt").argument));
     try testing.expectEqual(Command.stor, parse("STOR upload.bin").command);
+}
+
+test "parse file and optional commands" {
+    try testing.expectEqual(Command.dele, parse("DELE old.txt").command);
+    try testing.expectEqual(Command.rnfr, parse("RNFR old.txt").command);
+    try testing.expectEqual(Command.rnto, parse("RNTO new.txt").command);
+    try testing.expectEqual(Command.mkd, parse("MKD pub/newdir").command);
+    try testing.expectEqual(Command.rmd, parse("RMD pub/newdir").command);
+    try testing.expectEqual(Command.size, parse("SIZE readme.txt").command);
+    try testing.expectEqual(Command.mdtm, parse("MDTM readme.txt").command);
 }

@@ -1,4 +1,5 @@
 const pasv = @import("pasv.zig");
+const limits = @import("limits.zig");
 
 /// Authentication state for the control session.
 pub const AuthState = enum {
@@ -19,4 +20,6 @@ pub const Session = struct {
     transfer_type: TransferType = .binary,
     cwd_ready: bool = false,
     pasv_state: pasv.State = .PasvIdle,
+    rename_from_len: usize = 0,
+    rename_from: [limits.command_max]u8 = [_]u8{0} ** limits.command_max,
 };

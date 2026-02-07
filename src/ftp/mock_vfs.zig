@@ -8,6 +8,16 @@ pub const MockVfs = struct {
     uploaded_bytes: [1024]u8 = [_]u8{0} ** 1024,
     uploaded_len: usize = 0,
     write_chunk_limit: usize = std.math.maxInt(usize),
+    deleted_path: [128]u8 = [_]u8{0} ** 128,
+    deleted_path_len: usize = 0,
+    renamed_from_path: [128]u8 = [_]u8{0} ** 128,
+    renamed_from_len: usize = 0,
+    renamed_to_path: [128]u8 = [_]u8{0} ** 128,
+    renamed_to_len: usize = 0,
+    created_dir_path: [128]u8 = [_]u8{0} ** 128,
+    created_dir_len: usize = 0,
+    removed_dir_path: [128]u8 = [_]u8{0} ** 128,
+    removed_dir_len: usize = 0,
 
     /// Current working directory state represented as an absolute path.
     pub const Cwd = struct {
@@ -194,12 +204,88 @@ pub const MockVfs = struct {
 
     pub fn closeWrite(_: *MockVfs, _: *FileWriter) void {}
 
-    pub fn delete(_: *MockVfs, _: *const Cwd, _: []const u8) interfaces_fs.FsError!void {
-        return error.Unsupported;
+    pub fn delete(self: *MockVfs, cwd: *const Cwd, user_path: []const u8) interfaces_fs.FsError!void {
+        var path_buf: [128]u8 = undefined;
+        const path = try resolveFilePath(cwd, user_path, path_buf[0..]);
+
+        if (std.mem.eql(u8, path, "/missing.bin")) return error.NotFound;
+        if (std.mem.eql(u8, path, "/locked.bin")) return error.PermissionDenied;
+        if (std.mem.eql(u8, path, "/ioerr.bin")) return error.Io;
+        if (isKnownDir(path)) return error.IsDir;
+
+        if (path.len > self.deleted_path.len) return error.InvalidPath;
+        std.mem.copyForwards(u8, self.deleted_path[0..path.len], path);
+        self.deleted_path_len = path.len;
     }
 
-    pub fn rename(_: *MockVfs, _: *const Cwd, _: []const u8, _: []const u8) interfaces_fs.FsError!void {
-        return error.Unsupported;
+    pub fn rename(self: *MockVfs, cwd: *const Cwd, from_path: []const u8, to_path: []const u8) interfaces_fs.FsError!void {
+        var from_buf: [128]u8 = undefined;
+        var to_buf: [128]u8 = undefined;
+        const from = try resolveFilePath(cwd, from_path, from_buf[0..]);
+        const to = try resolveFilePath(cwd, to_path, to_buf[0..]);
+
+        if (std.mem.eql(u8, from, "/missing.bin")) return error.NotFound;
+        if (std.mem.eql(u8, from, "/locked.bin")) return error.PermissionDenied;
+        if (std.mem.eql(u8, from, "/ioerr.bin")) return error.Io;
+        if (std.mem.eql(u8, to, "/readme.txt")) return error.Exists;
+
+        if (from.len > self.renamed_from_path.len or to.len > self.renamed_to_path.len) return error.InvalidPath;
+        std.mem.copyForwards(u8, self.renamed_from_path[0..from.len], from);
+        self.renamed_from_len = from.len;
+        std.mem.copyForwards(u8, self.renamed_to_path[0..to.len], to);
+        self.renamed_to_len = to.len;
+    }
+
+    pub fn makeDir(self: *MockVfs, cwd: *const Cwd, user_path: []const u8) interfaces_fs.FsError!void {
+        var path_buf: [128]u8 = undefined;
+        const path = try resolveFilePath(cwd, user_path, path_buf[0..]);
+
+        if (std.mem.eql(u8, path, "/locked-new")) return error.PermissionDenied;
+        if (std.mem.eql(u8, path, "/ioerr-new")) return error.Io;
+        if (isKnownDir(path) or isKnownFile(path)) return error.Exists;
+
+        if (path.len > self.created_dir_path.len) return error.InvalidPath;
+        std.mem.copyForwards(u8, self.created_dir_path[0..path.len], path);
+        self.created_dir_len = path.len;
+    }
+
+    pub fn removeDir(self: *MockVfs, cwd: *const Cwd, user_path: []const u8) interfaces_fs.FsError!void {
+        var path_buf: [128]u8 = undefined;
+        const path = try resolveFilePath(cwd, user_path, path_buf[0..]);
+
+        if (std.mem.eql(u8, path, "/locked")) return error.PermissionDenied;
+        if (std.mem.eql(u8, path, "/ioerr")) return error.Io;
+        if (std.mem.eql(u8, path, "/missing")) return error.NotFound;
+        if (isKnownFile(path)) return error.NotDir;
+
+        if (path.len > self.removed_dir_path.len) return error.InvalidPath;
+        std.mem.copyForwards(u8, self.removed_dir_path[0..path.len], path);
+        self.removed_dir_len = path.len;
+    }
+
+    pub fn fileSize(_: *MockVfs, cwd: *const Cwd, user_path: []const u8) interfaces_fs.FsError!u64 {
+        var path_buf: [128]u8 = undefined;
+        const path = try resolveFilePath(cwd, user_path, path_buf[0..]);
+        if (std.mem.eql(u8, path, "/missing.bin")) return error.NotFound;
+        if (std.mem.eql(u8, path, "/locked.bin")) return error.PermissionDenied;
+        if (std.mem.eql(u8, path, "/ioerr.bin")) return error.Io;
+        if (isKnownDir(path)) return error.IsDir;
+
+        if (std.mem.eql(u8, path, "/readme.txt")) return readme_bytes.len;
+        if (std.mem.eql(u8, path, "/pub/upload.txt")) return upload_bytes.len;
+        return 42;
+    }
+
+    pub fn fileMtime(_: *MockVfs, cwd: *const Cwd, user_path: []const u8) interfaces_fs.FsError!i64 {
+        var path_buf: [128]u8 = undefined;
+        const path = try resolveFilePath(cwd, user_path, path_buf[0..]);
+        if (std.mem.eql(u8, path, "/missing.bin")) return error.NotFound;
+        if (std.mem.eql(u8, path, "/locked.bin")) return error.PermissionDenied;
+        if (std.mem.eql(u8, path, "/ioerr.bin")) return error.Io;
+        if (isKnownDir(path)) return error.IsDir;
+
+        if (std.mem.eql(u8, path, "/readme.txt")) return 1_704_067_230; // 2024-01-03 10:20:30 UTC
+        return 1_704_067_231;
     }
 
     fn isKnownDir(path: []const u8) bool {

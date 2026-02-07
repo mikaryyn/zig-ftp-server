@@ -160,12 +160,66 @@ pub const VfsOs = struct {
         writer.file.close(self.io);
     }
 
-    pub fn delete(_: *VfsOs, _: *const Cwd, _: []const u8) interfaces_fs.FsError!void {
-        return error.Unsupported;
+    pub fn delete(self: *VfsOs, cwd: *const Cwd, user_path: []const u8) interfaces_fs.FsError!void {
+        var target_buf: [max_path_len]u8 = undefined;
+        const target = try normalizePath(cwd, user_path, target_buf[0..]);
+
+        var rel_buf: [max_path_len]u8 = undefined;
+        const rel_path = try toRelative(target, rel_buf[0..]);
+        self.root_dir.deleteFile(self.io, rel_path) catch |err| return mapFsError(err);
     }
 
-    pub fn rename(_: *VfsOs, _: *const Cwd, _: []const u8, _: []const u8) interfaces_fs.FsError!void {
-        return error.Unsupported;
+    pub fn rename(self: *VfsOs, cwd: *const Cwd, from_path: []const u8, to_path: []const u8) interfaces_fs.FsError!void {
+        var from_buf: [max_path_len]u8 = undefined;
+        var to_buf: [max_path_len]u8 = undefined;
+        const from_target = try normalizePath(cwd, from_path, from_buf[0..]);
+        const to_target = try normalizePath(cwd, to_path, to_buf[0..]);
+
+        var from_rel_buf: [max_path_len]u8 = undefined;
+        var to_rel_buf: [max_path_len]u8 = undefined;
+        const from_rel = try toRelative(from_target, from_rel_buf[0..]);
+        const to_rel = try toRelative(to_target, to_rel_buf[0..]);
+        self.root_dir.renamePreserve(from_rel, self.root_dir, to_rel, self.io) catch |err| return mapFsError(err);
+    }
+
+    pub fn makeDir(self: *VfsOs, cwd: *const Cwd, user_path: []const u8) interfaces_fs.FsError!void {
+        var target_buf: [max_path_len]u8 = undefined;
+        const target = try normalizePath(cwd, user_path, target_buf[0..]);
+
+        var rel_buf: [max_path_len]u8 = undefined;
+        const rel_path = try toRelative(target, rel_buf[0..]);
+        self.root_dir.createDir(self.io, rel_path, .default_dir) catch |err| return mapFsError(err);
+    }
+
+    pub fn removeDir(self: *VfsOs, cwd: *const Cwd, user_path: []const u8) interfaces_fs.FsError!void {
+        var target_buf: [max_path_len]u8 = undefined;
+        const target = try normalizePath(cwd, user_path, target_buf[0..]);
+
+        var rel_buf: [max_path_len]u8 = undefined;
+        const rel_path = try toRelative(target, rel_buf[0..]);
+        self.root_dir.deleteDir(self.io, rel_path) catch |err| return mapFsError(err);
+    }
+
+    pub fn fileSize(self: *VfsOs, cwd: *const Cwd, user_path: []const u8) interfaces_fs.FsError!u64 {
+        var target_buf: [max_path_len]u8 = undefined;
+        const target = try normalizePath(cwd, user_path, target_buf[0..]);
+
+        var rel_buf: [max_path_len]u8 = undefined;
+        const rel_path = try toRelative(target, rel_buf[0..]);
+        const st = self.root_dir.statFile(self.io, rel_path, .{}) catch |err| return mapFsError(err);
+        if (st.kind != .file) return error.IsDir;
+        return st.size;
+    }
+
+    pub fn fileMtime(self: *VfsOs, cwd: *const Cwd, user_path: []const u8) interfaces_fs.FsError!i64 {
+        var target_buf: [max_path_len]u8 = undefined;
+        const target = try normalizePath(cwd, user_path, target_buf[0..]);
+
+        var rel_buf: [max_path_len]u8 = undefined;
+        const rel_path = try toRelative(target, rel_buf[0..]);
+        const st = self.root_dir.statFile(self.io, rel_path, .{}) catch |err| return mapFsError(err);
+        if (st.kind != .file) return error.IsDir;
+        return st.mtime.toSeconds();
     }
 };
 

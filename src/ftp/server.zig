@@ -16,6 +16,10 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
 
     return struct {
         const Self = @This();
+        const has_make_dir = @hasDecl(Fs, "makeDir");
+        const has_remove_dir = @hasDecl(Fs, "removeDir");
+        const has_file_size = @hasDecl(Fs, "fileSize");
+        const has_file_mtime = @hasDecl(Fs, "fileMtime");
 
         net: *Net,
         fs: *Fs,
@@ -157,6 +161,11 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
                 return;
             }
 
+            if (self.session.rename_from_len > 0 and parsed.command != .rnto) {
+                try self.queueLine(503, "Bad sequence of commands");
+                return;
+            }
+
             switch (parsed.command) {
                 .user, .pass => try self.queueLine(230, "User logged in"),
                 .noop => try self.queueLine(200, "OK"),
@@ -170,6 +179,13 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
                 .pwd => try self.handlePwd(),
                 .cwd => try self.handleCwd(parsed.argument),
                 .cdup => try self.handleCdup(),
+                .dele => try self.handleDele(parsed.argument),
+                .rnfr => try self.handleRnfr(parsed.argument),
+                .rnto => try self.handleRnto(parsed.argument),
+                .mkd => try self.handleMkd(parsed.argument),
+                .rmd => try self.handleRmd(parsed.argument),
+                .size => try self.handleSize(parsed.argument),
+                .mdtm => try self.handleMdtm(parsed.argument),
                 .unknown => try self.queueLine(502, "Command not implemented"),
                 .quit => unreachable,
             }
@@ -249,11 +265,21 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
         }
 
         fn queueFeat(self: *Self) interfaces_net.NetError!void {
-            const features = [_][]const u8{
-                "TYPE I",
-                "PASV",
-            };
-            self.reply_writer.queueFeat(features[0..]) catch return error.Io;
+            var features: [4][]const u8 = undefined;
+            var len: usize = 0;
+            features[len] = "TYPE I";
+            len += 1;
+            features[len] = "PASV";
+            len += 1;
+            if (has_file_size) {
+                features[len] = "SIZE";
+                len += 1;
+            }
+            if (has_file_mtime) {
+                features[len] = "MDTM";
+                len += 1;
+            }
+            self.reply_writer.queueFeat(features[0..len]) catch return error.Io;
         }
 
         fn queueLine(self: *Self, code: u16, text: []const u8) interfaces_net.NetError!void {
@@ -435,6 +461,205 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
             self.stor_transfer = .{
                 .state = .stor_waiting_accept,
             };
+        }
+
+        fn handleDele(self: *Self, arg: []const u8) interfaces_net.NetError!void {
+            const path = std.mem.trim(u8, arg, " ");
+            if (path.len == 0) {
+                try self.queueLine(501, "Syntax error in parameters or arguments");
+                return;
+            }
+
+            const cwd = self.requireCwd() orelse {
+                try self.queueLine(451, "Requested action aborted: local error in processing");
+                return;
+            };
+            self.fs.delete(cwd, path) catch |err| {
+                try self.queueFsError(err);
+                return;
+            };
+            try self.queueLine(250, "Requested file action okay, completed");
+        }
+
+        fn handleRnfr(self: *Self, arg: []const u8) interfaces_net.NetError!void {
+            const path = std.mem.trim(u8, arg, " ");
+            if (path.len == 0) {
+                try self.queueLine(501, "Syntax error in parameters or arguments");
+                return;
+            }
+            if (path.len > self.session.rename_from.len) {
+                try self.queueLine(553, "Requested action not taken. File name not allowed");
+                return;
+            }
+
+            std.mem.copyForwards(u8, self.session.rename_from[0..path.len], path);
+            self.session.rename_from_len = path.len;
+            try self.queueLine(350, "Requested file action pending further information");
+        }
+
+        fn handleRnto(self: *Self, arg: []const u8) interfaces_net.NetError!void {
+            if (self.session.rename_from_len == 0) {
+                try self.queueLine(503, "Bad sequence of commands");
+                return;
+            }
+
+            const to_path = std.mem.trim(u8, arg, " ");
+            if (to_path.len == 0) {
+                try self.queueLine(501, "Syntax error in parameters or arguments");
+                return;
+            }
+
+            const cwd = self.requireCwd() orelse {
+                try self.queueLine(451, "Requested action aborted: local error in processing");
+                return;
+            };
+            const from_path = self.session.rename_from[0..self.session.rename_from_len];
+            self.fs.rename(cwd, from_path, to_path) catch |err| {
+                self.session.rename_from_len = 0;
+                try self.queueFsError(err);
+                return;
+            };
+            self.session.rename_from_len = 0;
+            try self.queueLine(250, "Requested file action okay, completed");
+        }
+
+        fn handleMkd(self: *Self, arg: []const u8) interfaces_net.NetError!void {
+            if (comptime !has_make_dir) {
+                try self.queueLine(502, "Command not implemented");
+                return;
+            }
+
+            const path = std.mem.trim(u8, arg, " ");
+            if (path.len == 0) {
+                try self.queueLine(501, "Syntax error in parameters or arguments");
+                return;
+            }
+
+            const cwd = self.requireCwd() orelse {
+                try self.queueLine(451, "Requested action aborted: local error in processing");
+                return;
+            };
+            self.fs.makeDir(cwd, path) catch |err| {
+                if (err == error.Unsupported) {
+                    try self.queueLine(502, "Command not implemented");
+                    return;
+                }
+                try self.queueFsError(err);
+                return;
+            };
+
+            const msg = std.fmt.bufPrint(self.storage.scratch, "\"{s}\"", .{path}) catch {
+                try self.queueLine(257, "Directory created");
+                return;
+            };
+            try self.queueLine(257, msg);
+        }
+
+        fn handleRmd(self: *Self, arg: []const u8) interfaces_net.NetError!void {
+            if (comptime !has_remove_dir) {
+                try self.queueLine(502, "Command not implemented");
+                return;
+            }
+
+            const path = std.mem.trim(u8, arg, " ");
+            if (path.len == 0) {
+                try self.queueLine(501, "Syntax error in parameters or arguments");
+                return;
+            }
+
+            const cwd = self.requireCwd() orelse {
+                try self.queueLine(451, "Requested action aborted: local error in processing");
+                return;
+            };
+            self.fs.removeDir(cwd, path) catch |err| {
+                if (err == error.Unsupported) {
+                    try self.queueLine(502, "Command not implemented");
+                    return;
+                }
+                try self.queueFsError(err);
+                return;
+            };
+            try self.queueLine(250, "Requested file action okay, completed");
+        }
+
+        fn handleSize(self: *Self, arg: []const u8) interfaces_net.NetError!void {
+            if (comptime !has_file_size) {
+                try self.queueLine(502, "Command not implemented");
+                return;
+            }
+
+            const path = std.mem.trim(u8, arg, " ");
+            if (path.len == 0) {
+                try self.queueLine(501, "Syntax error in parameters or arguments");
+                return;
+            }
+
+            const cwd = self.requireCwd() orelse {
+                try self.queueLine(451, "Requested action aborted: local error in processing");
+                return;
+            };
+            const size = self.fs.fileSize(cwd, path) catch |err| {
+                if (err == error.Unsupported) {
+                    try self.queueLine(502, "Command not implemented");
+                    return;
+                }
+                try self.queueFsError(err);
+                return;
+            };
+
+            const msg = std.fmt.bufPrint(self.storage.scratch, "{d}", .{size}) catch {
+                try self.queueLine(451, "Requested action aborted: local error in processing");
+                return;
+            };
+            try self.queueLine(213, msg);
+        }
+
+        fn handleMdtm(self: *Self, arg: []const u8) interfaces_net.NetError!void {
+            if (comptime !has_file_mtime) {
+                try self.queueLine(502, "Command not implemented");
+                return;
+            }
+
+            const path = std.mem.trim(u8, arg, " ");
+            if (path.len == 0) {
+                try self.queueLine(501, "Syntax error in parameters or arguments");
+                return;
+            }
+
+            const cwd = self.requireCwd() orelse {
+                try self.queueLine(451, "Requested action aborted: local error in processing");
+                return;
+            };
+            const unix_seconds = self.fs.fileMtime(cwd, path) catch |err| {
+                if (err == error.Unsupported) {
+                    try self.queueLine(502, "Command not implemented");
+                    return;
+                }
+                try self.queueFsError(err);
+                return;
+            };
+            if (unix_seconds < 0) {
+                try self.queueLine(451, "Requested action aborted: local error in processing");
+                return;
+            }
+
+            const ts = std.time.epoch.EpochSeconds{ .secs = @intCast(unix_seconds) };
+            const year_day = ts.getEpochDay().calculateYearDay();
+            const month_day = year_day.calculateMonthDay();
+            const day_seconds = ts.getDaySeconds();
+
+            const msg = std.fmt.bufPrint(self.storage.scratch, "{d:0>4}{d:0>2}{d:0>2}{d:0>2}{d:0>2}{d:0>2}", .{
+                year_day.year,
+                month_day.month.numeric(),
+                month_day.day_index + 1,
+                day_seconds.getHoursIntoDay(),
+                day_seconds.getMinutesIntoHour(),
+                day_seconds.getSecondsIntoMinute(),
+            }) catch {
+                try self.queueLine(451, "Requested action aborted: local error in processing");
+                return;
+            };
+            try self.queueLine(213, msg);
         }
 
         fn pollPasvAccept(self: *Self) interfaces_net.NetError!void {
@@ -868,8 +1093,24 @@ const MockFs = struct {
     pub fn closeWrite(self: *MockFs, writer: *FileWriter) void {
         self.vfs.closeWrite(writer);
     }
-    pub fn delete(_: *MockFs, _: *const Cwd, _: []const u8) interfaces_fs.FsError!void {}
-    pub fn rename(_: *MockFs, _: *const Cwd, _: []const u8, _: []const u8) interfaces_fs.FsError!void {}
+    pub fn delete(self: *MockFs, cwd: *const Cwd, path: []const u8) interfaces_fs.FsError!void {
+        try self.vfs.delete(cwd, path);
+    }
+    pub fn rename(self: *MockFs, cwd: *const Cwd, from: []const u8, to: []const u8) interfaces_fs.FsError!void {
+        try self.vfs.rename(cwd, from, to);
+    }
+    pub fn makeDir(self: *MockFs, cwd: *const Cwd, path: []const u8) interfaces_fs.FsError!void {
+        try self.vfs.makeDir(cwd, path);
+    }
+    pub fn removeDir(self: *MockFs, cwd: *const Cwd, path: []const u8) interfaces_fs.FsError!void {
+        try self.vfs.removeDir(cwd, path);
+    }
+    pub fn fileSize(self: *MockFs, cwd: *const Cwd, path: []const u8) interfaces_fs.FsError!u64 {
+        return self.vfs.fileSize(cwd, path);
+    }
+    pub fn fileMtime(self: *MockFs, cwd: *const Cwd, path: []const u8) interfaces_fs.FsError!i64 {
+        return self.vfs.fileMtime(cwd, path);
+    }
 };
 
 test "server handles login flow and basic commands" {
@@ -912,6 +1153,8 @@ test "server handles login flow and basic commands" {
         "211-Features:\r\n" ++
         " TYPE I\r\n" ++
         " PASV\r\n" ++
+        " SIZE\r\n" ++
+        " MDTM\r\n" ++
         "211 End\r\n" ++
         "221 Bye\r\n";
     try testing.expect(std.mem.eql(u8, expected, net.written()));
@@ -1482,6 +1725,126 @@ test "server maps CWD fs errors to replies" {
     try testing.expect(std.mem.indexOf(u8, net.written(), "550 File not found\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, net.written(), "550 Permission denied\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, net.written(), "451 Requested action aborted: local error in processing\r\n") != null);
+}
+
+test "server handles DELE RNFR RNTO and optional commands" {
+    var net: mock_net.MockNet = .{
+        .control_accept_script = &.{
+            .{ .conn = 1 },
+        },
+        .read_script = &.{
+            .{ .bytes = "USER test\r\nPASS secret\r\nDELE readme.txt\r\nRNFR readme.txt\r\nRNTO moved.txt\r\nMKD newdir\r\nRMD pub/nested\r\nSIZE readme.txt\r\nMDTM readme.txt\r\nQUIT\r\n" },
+        },
+    };
+    var fs: MockFs = .{};
+    const listener = try net.controlListen(.{});
+
+    var cmd_buf: [limits.command_max]u8 = undefined;
+    var reply_buf: [limits.reply_max]u8 = undefined;
+    var transfer_buf: [limits.transfer_max]u8 = undefined;
+    var scratch_buf: [limits.scratch_max]u8 = undefined;
+    var storage = misc.Storage.init(cmd_buf[0..], reply_buf[0..], transfer_buf[0..], scratch_buf[0..]);
+    storage.session = .{};
+
+    const Server = FtpServer(mock_net.MockNet, MockFs);
+    var server = Server.initNoHeap(&net, &fs, listener, .{
+        .user = "test",
+        .password = "secret",
+    }, &storage);
+
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        try server.tick(0);
+    }
+
+    const written = net.written();
+    try testing.expect(std.mem.indexOf(u8, written, "250 Requested file action okay, completed\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "350 Requested file action pending further information\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "257 \"newdir\"\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "213 17\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "213 20240103102030\r\n") != null);
+    try testing.expect(std.mem.eql(u8, "/readme.txt", fs.vfs.deleted_path[0..fs.vfs.deleted_path_len]));
+    try testing.expect(std.mem.eql(u8, "/readme.txt", fs.vfs.renamed_from_path[0..fs.vfs.renamed_from_len]));
+    try testing.expect(std.mem.eql(u8, "/moved.txt", fs.vfs.renamed_to_path[0..fs.vfs.renamed_to_len]));
+    try testing.expect(std.mem.eql(u8, "/newdir", fs.vfs.created_dir_path[0..fs.vfs.created_dir_len]));
+    try testing.expect(std.mem.eql(u8, "/pub/nested", fs.vfs.removed_dir_path[0..fs.vfs.removed_dir_len]));
+}
+
+test "server enforces strict RNFR RNTO sequencing" {
+    var net: mock_net.MockNet = .{
+        .control_accept_script = &.{
+            .{ .conn = 1 },
+        },
+        .read_script = &.{
+            .{ .bytes = "USER test\r\nPASS secret\r\nRNFR readme.txt\r\nNOOP\r\nRNTO moved.txt\r\nQUIT\r\n" },
+        },
+    };
+    var fs: MockFs = .{};
+    const listener = try net.controlListen(.{});
+
+    var cmd_buf: [limits.command_max]u8 = undefined;
+    var reply_buf: [limits.reply_max]u8 = undefined;
+    var transfer_buf: [limits.transfer_max]u8 = undefined;
+    var scratch_buf: [limits.scratch_max]u8 = undefined;
+    var storage = misc.Storage.init(cmd_buf[0..], reply_buf[0..], transfer_buf[0..], scratch_buf[0..]);
+    storage.session = .{};
+
+    const Server = FtpServer(mock_net.MockNet, MockFs);
+    var server = Server.initNoHeap(&net, &fs, listener, .{
+        .user = "test",
+        .password = "secret",
+    }, &storage);
+
+    var i: usize = 0;
+    while (i < 24) : (i += 1) {
+        try server.tick(0);
+    }
+
+    const written = net.written();
+    const idx_350 = std.mem.indexOf(u8, written, "350 Requested file action pending further information\r\n") orelse return error.UnexpectedTestResult;
+    const idx_503 = std.mem.indexOf(u8, written, "503 Bad sequence of commands\r\n") orelse return error.UnexpectedTestResult;
+    const idx_250 = std.mem.lastIndexOf(u8, written, "250 Requested file action okay, completed\r\n") orelse return error.UnexpectedTestResult;
+    try testing.expect(idx_350 < idx_503);
+    try testing.expect(idx_503 < idx_250);
+}
+
+test "server maps milestone 11 fs errors to replies" {
+    var net: mock_net.MockNet = .{
+        .control_accept_script = &.{
+            .{ .conn = 1 },
+        },
+        .read_script = &.{
+            .{ .bytes = "USER test\r\nPASS secret\r\nDELE missing.bin\r\nDELE bad\x00name\r\nRNFR ioerr.bin\r\nRNTO moved.bin\r\nMKD locked-new\r\nRMD missing\r\nSIZE /docs\r\nMDTM missing.bin\r\nRNTO moved.bin\r\nQUIT\r\n" },
+        },
+    };
+    var fs: MockFs = .{};
+    const listener = try net.controlListen(.{});
+
+    var cmd_buf: [limits.command_max]u8 = undefined;
+    var reply_buf: [limits.reply_max]u8 = undefined;
+    var transfer_buf: [limits.transfer_max]u8 = undefined;
+    var scratch_buf: [limits.scratch_max]u8 = undefined;
+    var storage = misc.Storage.init(cmd_buf[0..], reply_buf[0..], transfer_buf[0..], scratch_buf[0..]);
+    storage.session = .{};
+
+    const Server = FtpServer(mock_net.MockNet, MockFs);
+    var server = Server.initNoHeap(&net, &fs, listener, .{
+        .user = "test",
+        .password = "secret",
+    }, &storage);
+
+    var i: usize = 0;
+    while (i < 56) : (i += 1) {
+        try server.tick(0);
+    }
+
+    const written = net.written();
+    try testing.expect(std.mem.indexOf(u8, written, "550 File not found\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "553 Requested action not taken. File name not allowed\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "451 Requested action aborted: local error in processing\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "550 Permission denied\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "550 Requested action not taken\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "503 Bad sequence of commands\r\n") != null);
 }
 
 test "server TYPE A returns matching reply text" {
