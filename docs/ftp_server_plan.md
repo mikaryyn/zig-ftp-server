@@ -14,7 +14,7 @@ This repository must also include a runnable CLI harness that wires the library 
 
 - [x] (2026-02-07 18:45Z) Record initial design decisions (below) and keep this plan updated during implementation.
 - [x] (2026-02-07 18:45Z) Milestone 1: Scaffolding + compile-time interfaces + first tests pass via `zig build test`.
-- [ ] Milestone 2: Minimal CLI harness (`NetStd`) that accepts a control connection and closes (or sends a banner), proving the app runs.
+- [x] (2026-02-07 19:10Z) Milestone 2: Minimal CLI harness (`NetStd`) that accepts a control connection and closes (or sends a banner), proving the app runs.
 - [ ] Milestone 3: Control-channel CRLF line reader + reply writer (non-blocking) with unit tests.
 - [ ] Milestone 4: Session state machine + auth + basic commands (`USER`, `PASS`, `QUIT`, `NOOP`, `SYST`, `TYPE`, `FEAT`) with mock-net tests.
 - [ ] Milestone 5: Fs interface usage + navigation commands (`PWD`, `CWD`, `CDUP`) with mock-fs tests.
@@ -57,6 +57,7 @@ This repository must also include a runnable CLI harness that wires the library 
 ## Outcomes & Retrospective
 
 - Milestone 1 delivered the scaffolding: limits/constants, Net/Fs interface definitions with compile-time validation, a placeholder public API, and a passing `zig build test` with mock instantiation. Remaining work proceeds with control-channel I/O and state machine implementation.
+- Milestone 2 delivered a runnable CLI harness (`ftp-server`) with a minimal non-blocking listener/accept loop (`NetStd`) that accepts one connection, optionally writes a banner, and closes, proving the app can run and be smoke-tested with `nc`.
 
 ## Context and Orientation
 

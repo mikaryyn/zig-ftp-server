@@ -1,3 +1,4 @@
+/// Error set shared by filesystem implementations.
 pub const FsError = error{
     NotFound,
     NotDir,
@@ -11,22 +12,31 @@ pub const FsError = error{
     Unsupported,
 };
 
+/// The kind of path reported by a directory listing entry.
 pub const PathKind = enum { file, dir };
 
+/// A single directory entry returned by the filesystem iterator.
 pub const DirEntry = struct {
+    /// Entry name without path separators.
     name: []const u8,
+    /// Whether the entry is a file or directory.
     kind: PathKind,
+    /// Optional file size in bytes.
     size: ?u64 = null,
+    /// Optional UNIX mtime in seconds.
     mtime_unix: ?i64 = null,
 };
 
+/// Compile-time description of the Fs interface.
 pub fn FsInterface(comptime Fs: type) type {
     _ = Fs;
     return struct {
+        /// Error set alias for Fs implementations.
         pub const Error = FsError;
     };
 }
 
+/// Validate that a type satisfies the Fs interface.
 pub fn validate(comptime Fs: type) void {
     const missing = struct {
         fn decl(name: []const u8) void {

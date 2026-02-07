@@ -1,41 +1,68 @@
 const std = @import("std");
 
+/// Compile-time limits for control and data buffers.
 pub const limits = @import("ftp/limits.zig");
+/// Net interface definitions and validation helpers.
 pub const interfaces_net = @import("ftp/interfaces_net.zig");
+/// Fs interface definitions and validation helpers.
 pub const interfaces_fs = @import("ftp/interfaces_fs.zig");
 
+/// Size configuration for the core buffers.
 pub const Buffers = struct {
+    /// Maximum command line length buffer.
     command_len: usize = limits.command_max,
+    /// Maximum reply line length buffer.
     reply_len: usize = limits.reply_max,
+    /// Transfer streaming buffer length.
     transfer_len: usize = limits.transfer_max,
+    /// Scratch buffer length for parsing/formatting.
     scratch_len: usize = limits.scratch_max,
 };
 
+/// Optional timeout configuration for control and data paths.
 pub const Timeouts = struct {
+    /// Optional idle timeout for the control connection.
     control_idle_ms: ?u64 = null,
+    /// Optional idle timeout while waiting for PASV data connections.
     pasv_idle_ms: ?u64 = null,
+    /// Optional idle timeout during transfers.
     transfer_idle_ms: ?u64 = null,
 };
 
+/// Server configuration for the single-session core.
 pub const Config = struct {
+    /// Username required for login.
     user: []const u8,
+    /// Password required for login.
     password: []const u8,
+    /// Human-readable banner text.
     banner: []const u8 = "FTP Server Ready",
+    /// Buffer sizing configuration.
     buffers: Buffers = .{},
+    /// Optional timeout configuration.
     timeouts: ?Timeouts = null,
 };
 
+/// Opaque placeholder for the session state (populated in later milestones).
 pub const Session = struct {
+    /// Reserved for future session state.
     _reserved: u8 = 0,
 };
 
+/// Caller-owned storage for the core buffers and session state.
 pub const Storage = struct {
+    /// Single-session state storage.
     session: Session = .{},
+    /// Command line buffer storage.
     command_buf: []u8,
+    /// Reply line buffer storage.
     reply_buf: []u8,
+    /// Data transfer buffer storage.
     transfer_buf: []u8,
+    /// Scratch buffer storage.
     scratch: []u8,
 
+    /// Initialize storage with preallocated buffers.
     pub fn init(command_buf: []u8, reply_buf: []u8, transfer_buf: []u8, scratch: []u8) Storage {
         return .{
             .command_buf = command_buf,
@@ -46,6 +73,7 @@ pub const Storage = struct {
     }
 };
 
+/// Instantiate the FTP server core for a given Net and Fs implementation.
 pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
     interfaces_net.validate(Net);
     interfaces_fs.validate(Fs);
@@ -53,13 +81,19 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
     return struct {
         const Self = @This();
 
+        /// Net implementation backing the server.
         net: *Net,
+        /// Fs implementation backing the server.
         fs: *Fs,
+        /// Server configuration (credentials, banner, buffers).
         config: Config,
+        /// Caller-owned storage for session state and buffers.
         storage: *Storage,
 
+        /// Type alias for the passive bind hint derived from the Net address type.
         pub const PasvBindHint = interfaces_net.PasvBindHint(Net.Address);
 
+        /// Initialize the server with caller-owned storage and no heap allocation.
         pub fn initNoHeap(net: *Net, fs: *Fs, config: Config, storage: *Storage) !Self {
             return .{
                 .net = net,
@@ -71,8 +105,10 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
     };
 }
 
+/// Testing utilities for the module tests.
 const testing = std.testing;
 
+/// Minimal Net mock for compile-time interface validation.
 const MockNet = struct {
     pub const ControlListener = struct {};
     pub const Conn = struct {};
@@ -116,6 +152,7 @@ const MockNet = struct {
     }
 };
 
+/// Minimal Fs mock for compile-time interface validation.
 const MockFs = struct {
     pub const Cwd = struct {};
     pub const FileReader = struct {};

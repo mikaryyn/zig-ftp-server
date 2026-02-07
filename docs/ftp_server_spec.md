@@ -71,7 +71,7 @@ Optional examples/tests (`test/` or `src/ftp/test/`):
 
 - All code must compile and run using **Zig 0.16** APIs (no older/newer `std` assumptions).
 - The Zig compiler + standard library are located at `~/zig`.
-  - Prefer invoking the compiler explicitly as `~/zig/zig` in local scripts/docs if needed.
+  - ALWAYS invoke the compiler explicitly as `~/zig/zig`.
   - Keep the library’s `build.zig` / CLI harness compatible with Zig 0.16’s build system APIs.
 
 ## Core Types & Configuration
