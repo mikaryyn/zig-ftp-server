@@ -6,6 +6,8 @@ pub const TransferState = enum {
     idle,
     list_waiting_accept,
     list_streaming,
+    retr_waiting_accept,
+    retr_streaming,
 };
 
 /// Server-side LIST transfer bookkeeping.
@@ -16,6 +18,18 @@ pub const ListTransfer = struct {
     exhausted: bool = false,
 
     pub fn reset(self: *ListTransfer) void {
+        self.* = .{};
+    }
+};
+
+/// Server-side RETR transfer bookkeeping.
+pub const RetrTransfer = struct {
+    state: TransferState = .idle,
+    chunk_len: usize = 0,
+    chunk_off: usize = 0,
+    eof: bool = false,
+
+    pub fn reset(self: *RetrTransfer) void {
         self.* = .{};
     }
 };

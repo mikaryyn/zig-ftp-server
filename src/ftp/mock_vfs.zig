@@ -13,7 +13,10 @@ pub const MockVfs = struct {
         }
     };
 
-    pub const FileReader = struct {};
+    pub const FileReader = struct {
+        bytes: []const u8 = "",
+        off: usize = 0,
+    };
     pub const FileWriter = struct {};
     pub const DirIter = struct {
         entries: []const interfaces_fs.DirEntry = &.{},
@@ -128,16 +131,33 @@ pub const MockVfs = struct {
 
     pub fn dirClose(_: *MockVfs, _: *DirIter) void {}
 
-    pub fn openRead(_: *MockVfs, _: *const Cwd, _: []const u8) interfaces_fs.FsError!FileReader {
-        return error.Unsupported;
+    pub fn openRead(_: *MockVfs, cwd: *const Cwd, user_path: []const u8) interfaces_fs.FsError!FileReader {
+        var path_buf: [128]u8 = undefined;
+        const path = try resolveFilePath(cwd, user_path, path_buf[0..]);
+        if (std.mem.eql(u8, path, "/missing.bin")) return error.NotFound;
+        if (std.mem.eql(u8, path, "/locked.bin")) return error.PermissionDenied;
+        if (isKnownDir(path)) return error.IsDir;
+
+        if (std.mem.eql(u8, path, "/readme.txt")) {
+            return .{ .bytes = readme_bytes[0..] };
+        }
+        if (std.mem.eql(u8, path, "/pub/upload.txt")) {
+            return .{ .bytes = upload_bytes[0..] };
+        }
+        return error.NotFound;
     }
 
     pub fn openWriteTrunc(_: *MockVfs, _: *const Cwd, _: []const u8) interfaces_fs.FsError!FileWriter {
         return error.Unsupported;
     }
 
-    pub fn readFile(_: *MockVfs, _: *FileReader, _: []u8) interfaces_fs.FsError!usize {
-        return error.Unsupported;
+    pub fn readFile(_: *MockVfs, reader: *FileReader, out: []u8) interfaces_fs.FsError!usize {
+        if (reader.off >= reader.bytes.len) return 0;
+        const remaining = reader.bytes.len - reader.off;
+        const n = @min(remaining, out.len);
+        std.mem.copyForwards(u8, out[0..n], reader.bytes[reader.off .. reader.off + n]);
+        reader.off += n;
+        return n;
     }
 
     pub fn writeFile(_: *MockVfs, _: *FileWriter, _: []const u8) interfaces_fs.FsError!usize {
@@ -181,6 +201,22 @@ pub const MockVfs = struct {
         return out[0..cwd.len];
     }
 
+    fn resolveFilePath(cwd: *const Cwd, user_path: []const u8, out: []u8) interfaces_fs.FsError![]const u8 {
+        if (user_path.len == 0) return error.InvalidPath;
+        if (std.mem.indexOfScalar(u8, user_path, 0) != null) return error.InvalidPath;
+
+        if (user_path[0] == '/') {
+            if (user_path.len > out.len) return error.InvalidPath;
+            std.mem.copyForwards(u8, out[0..user_path.len], user_path);
+            return out[0..user_path.len];
+        }
+
+        if (cwd.len == 1 and cwd.path[0] == '/') {
+            return std.fmt.bufPrint(out, "/{s}", .{user_path}) catch error.InvalidPath;
+        }
+        return std.fmt.bufPrint(out, "{s}/{s}", .{ cwd.asSlice(), user_path }) catch error.InvalidPath;
+    }
+
     fn entriesFor(path: []const u8) ?[]const interfaces_fs.DirEntry {
         if (std.mem.eql(u8, path, "/")) return root_entries[0..];
         if (std.mem.eql(u8, path, "/pub")) return pub_entries[0..];
@@ -202,6 +238,8 @@ pub const MockVfs = struct {
         .{ .name = "guide.md", .kind = .file, .size = 64 },
     };
     const nested_entries = [_]interfaces_fs.DirEntry{};
+    const readme_bytes = "mock-readme-bytes\n";
+    const upload_bytes = "uploaded-through-mock\n";
 };
 
 const testing = std.testing;
@@ -252,4 +290,20 @@ test "mock vfs directory iterator returns deterministic entries" {
     try testing.expectEqual(@as(?u64, 123), third.size);
 
     try testing.expectEqual(@as(?interfaces_fs.DirEntry, null), try vfs.dirNext(&iter));
+}
+
+test "mock vfs openRead streams deterministic file bytes" {
+    var vfs: MockVfs = .{};
+    var cwd = try vfs.cwdInit();
+
+    var reader = try vfs.openRead(&cwd, "readme.txt");
+    defer vfs.closeRead(&reader);
+
+    var buf: [64]u8 = undefined;
+    const n1 = try vfs.readFile(&reader, buf[0..4]);
+    try testing.expectEqual(@as(usize, 4), n1);
+    const n2 = try vfs.readFile(&reader, buf[n1..]);
+    try testing.expect(std.mem.eql(u8, "mock-readme-bytes\n", buf[0 .. n1 + n2]));
+
+    try testing.expectEqual(@as(usize, 0), try vfs.readFile(&reader, buf[0..]));
 }

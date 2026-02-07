@@ -21,7 +21,7 @@ This repository must also include a runnable CLI harness that wires the library 
 - [x] (2026-02-07 22:05Z) Milestone 6: CLI harness (`NetStd` + `VfsOs`) wired to core + manual “login and PWD” smoke test.
 - [x] (2026-02-07 22:32Z) Milestone 7: PASV lifecycle + data accept plumbing + `PASV` command with tests and manual smoke test.
 - [x] (2026-02-07 22:54Z) Milestone 8: `LIST` streaming implementation with tests and manual smoke test.
-- [ ] Milestone 9: `RETR` streaming download with tests and manual smoke test.
+- [x] (2026-02-07 23:06Z) Milestone 9: `RETR` streaming download with tests and CLI VFS read support.
 - [ ] Milestone 10: `STOR` streaming upload with tests and manual smoke test.
 - [ ] Milestone 11: File ops (`DELE`, `RNFR`/`RNTO`) + optional ops (`MKD`, `RMD`, `SIZE`, `MDTM`) if enabled.
 - [ ] Milestone 12: Timeouts + limits hardening + error→reply mapping audit + integration tests.
@@ -65,6 +65,10 @@ This repository must also include a runnable CLI harness that wires the library 
   Rationale: Waiting to send `150` until a data socket exists avoids false-positive transfer starts and keeps control/data sequencing deterministic for clients.
   Date/Author: 2026-02-07 / Codex
 
+- Decision: During Milestone 9, `RETR` uses `150 Opening data connection` and `226 Closing data connection`, while `LIST` retains its existing text (`150 Here comes the directory listing`, `226 Directory send OK`).
+  Rationale: This keeps `RETR` aligned with the spec's generic transfer wording while preserving existing client-tested `LIST` reply text.
+  Date/Author: 2026-02-07 / Codex
+
 ## Outcomes & Retrospective
 
 - Milestone 1 delivered the scaffolding: limits/constants, Net/Fs interface definitions with compile-time validation, a placeholder public API, and a passing `zig build test` with mock instantiation. Remaining work proceeds with control-channel I/O and state machine implementation.
@@ -75,6 +79,7 @@ This repository must also include a runnable CLI harness that wires the library 
 - Milestone 6 delivered a full CLI harness wired to the protocol core: `src/cli/main.zig` now runs the `FtpServer` tick loop with `--listen`/`--root`/`--user`/`--pass`, `src/cli/net_std.zig` satisfies the compile-time `Net` interface for control-channel operation using non-blocking `std.net`, and `src/cli/vfs_os.zig` provides a rooted OS-backed `Fs` implementation for `cwd` operations with path normalization and NUL-byte rejection. Manual smoke validation with `./zig-out/bin/ftp-server` + `nc` confirmed the expected `220`/`331`/`230`/`257`/`221` sequence.
 - Milestone 7 delivered `src/ftp/pasv.zig` state definitions, session/server passive lifecycle wiring, `PASV` command support with `227` tuple formatting through the `Net` abstraction, passive accept polling (`PasvListening`→`DataConnected`), and mock-net tests proving repeated `PASV` closes prior listener/connection plus `425` enforcement for `LIST`/`RETR`/`STOR` without PASV.
 - Milestone 8 delivered streaming `LIST` transfers in `src/ftp/server.zig` and `src/ftp/transfer.zig`: the server now opens an iterator with `Fs.dirOpen`, waits for non-blocking PASV data accept before `150`, streams deterministic CRLF-terminated UNIX-like listing lines with partial-write resume, then closes iterator/data/listener and sends `226`. `src/ftp/mock_vfs.zig` and `src/cli/vfs_os.zig` now implement directory iteration for tests and CLI runtime. Automated validation passed via `~/zig/zig build test`; manual smoke with `curl --ftp-pasv ftp://127.0.0.1:2121/` returned expected listing entries.
+- Milestone 9 delivered non-blocking streaming `RETR` in `src/ftp/server.zig` and `src/ftp/transfer.zig`: `RETR <path>` now validates path args, opens `Fs.openRead`, waits for PASV accept before replying `150`, streams file bytes from `Fs.readFile` to data `Net.write` with partial-write resume, then closes file/data/listener and replies `226`. `src/ftp/mock_vfs.zig` now provides deterministic file reads, and `src/cli/vfs_os.zig` now implements OS-backed `openRead`/`readFile`/`closeRead` so CLI downloads can execute against real files. Automated validation passed via `~/zig/zig build test`.
 
 ## Context and Orientation
 
@@ -323,3 +328,4 @@ Plan Update Notes (2026-02-07): Completed Milestone 5 by adding filesystem-backe
 Plan Update Notes (2026-02-07): Completed Milestone 6 by wiring the real CLI harness (`main` + `NetStd` + rooted `VfsOs`) to the core server, fixing Zig 0.15.2 compatibility issues in argument/module wiring, and validating a manual login+PWD smoke test transcript.
 Plan Update Notes (2026-02-07): Completed Milestone 7 by adding PASV session lifecycle state, `PASV` command/reply plumbing, `Net` PASV tuple formatting support, passive accept tracking, and tests for repeated PASV cleanup plus `425 Use PASV first` transfer gating.
 Plan Update Notes (2026-02-07): Completed Milestone 8 by implementing non-blocking streaming `LIST` transfers (accept-gated `150`, CRLF listing writes with partial-write resume, and `226` completion), adding mock/OS directory iteration support, and validating via `~/zig/zig build test` plus a passive-mode `curl` smoke test.
+Plan Update Notes (2026-02-07): Completed Milestone 9 by implementing non-blocking `RETR` streaming with accept-gated `150`, partial data-write resume, and `226` completion; added mock VFS file-read support, server tests for RETR sequencing/partial writes/fs-error mapping, and OS VFS `openRead`/`readFile`/`closeRead` support; validated with `~/zig/zig build test`.

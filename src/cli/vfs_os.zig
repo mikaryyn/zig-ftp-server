@@ -14,7 +14,9 @@ pub const VfsOs = struct {
         len: usize = 1,
     };
 
-    pub const FileReader = struct {};
+    pub const FileReader = struct {
+        file: std.Io.File,
+    };
     pub const FileWriter = struct {};
     pub const DirIter = struct {
         dir: std.Io.Dir,
@@ -110,23 +112,36 @@ pub const VfsOs = struct {
         iter.dir.close(self.io);
     }
 
-    pub fn openRead(_: *VfsOs, _: *const Cwd, _: []const u8) interfaces_fs.FsError!FileReader {
-        return error.Unsupported;
+    pub fn openRead(self: *VfsOs, cwd: *const Cwd, user_path: []const u8) interfaces_fs.FsError!FileReader {
+        var target_buf: [max_path_len]u8 = undefined;
+        const target = try normalizePath(cwd, user_path, target_buf[0..]);
+
+        var rel_buf: [max_path_len]u8 = undefined;
+        const rel_path = try toRelative(target, rel_buf[0..]);
+
+        const file = self.root_dir.openFile(self.io, rel_path, .{
+            .mode = .read_only,
+            .allow_directory = false,
+        }) catch |err| return mapFsError(err);
+
+        return .{ .file = file };
     }
 
     pub fn openWriteTrunc(_: *VfsOs, _: *const Cwd, _: []const u8) interfaces_fs.FsError!FileWriter {
         return error.Unsupported;
     }
 
-    pub fn readFile(_: *VfsOs, _: *FileReader, _: []u8) interfaces_fs.FsError!usize {
-        return error.Unsupported;
+    pub fn readFile(self: *VfsOs, reader: *FileReader, out: []u8) interfaces_fs.FsError!usize {
+        return reader.file.readStreaming(self.io, &.{out}) catch |err| mapFsError(err);
     }
 
     pub fn writeFile(_: *VfsOs, _: *FileWriter, _: []const u8) interfaces_fs.FsError!usize {
         return error.Unsupported;
     }
 
-    pub fn closeRead(_: *VfsOs, _: *FileReader) void {}
+    pub fn closeRead(self: *VfsOs, reader: *FileReader) void {
+        reader.file.close(self.io);
+    }
 
     pub fn closeWrite(_: *VfsOs, _: *FileWriter) void {}
 
