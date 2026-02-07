@@ -1,0 +1,67 @@
+const std = @import("std");
+
+/// Supported control-channel commands for Milestone 4.
+pub const Command = enum {
+    user,
+    pass,
+    quit,
+    noop,
+    syst,
+    type_,
+    feat,
+    unknown,
+};
+
+/// Parsed FTP command line (`CMD` + optional argument).
+pub const Parsed = struct {
+    command: Command,
+    argument: []const u8,
+};
+
+/// Parse one command line without the trailing CRLF.
+pub fn parse(line: []const u8) Parsed {
+    const trimmed = std.mem.trim(u8, line, " ");
+    if (trimmed.len == 0) {
+        return .{ .command = .unknown, .argument = "" };
+    }
+
+    const cmd_end = std.mem.indexOfScalar(u8, trimmed, ' ') orelse trimmed.len;
+    const cmd_text = trimmed[0..cmd_end];
+    const arg_text = std.mem.trimLeft(u8, trimmed[cmd_end..], " ");
+
+    return .{
+        .command = parseCommand(cmd_text),
+        .argument = arg_text,
+    };
+}
+
+fn parseCommand(cmd_text: []const u8) Command {
+    if (std.ascii.eqlIgnoreCase(cmd_text, "USER")) return .user;
+    if (std.ascii.eqlIgnoreCase(cmd_text, "PASS")) return .pass;
+    if (std.ascii.eqlIgnoreCase(cmd_text, "QUIT")) return .quit;
+    if (std.ascii.eqlIgnoreCase(cmd_text, "NOOP")) return .noop;
+    if (std.ascii.eqlIgnoreCase(cmd_text, "SYST")) return .syst;
+    if (std.ascii.eqlIgnoreCase(cmd_text, "TYPE")) return .type_;
+    if (std.ascii.eqlIgnoreCase(cmd_text, "FEAT")) return .feat;
+    return .unknown;
+}
+
+const testing = std.testing;
+
+test "parse command and argument" {
+    const parsed = parse("USER test");
+    try testing.expectEqual(Command.user, parsed.command);
+    try testing.expect(std.mem.eql(u8, "test", parsed.argument));
+}
+
+test "parse is case insensitive and trims left arg spaces" {
+    const parsed = parse("tYpE    I");
+    try testing.expectEqual(Command.type_, parsed.command);
+    try testing.expect(std.mem.eql(u8, "I", parsed.argument));
+}
+
+test "parse unknown for empty line" {
+    const parsed = parse("");
+    try testing.expectEqual(Command.unknown, parsed.command);
+    try testing.expectEqual(@as(usize, 0), parsed.argument.len);
+}

@@ -3,6 +3,10 @@ const interfaces_net = @import("interfaces_net.zig");
 
 /// Deterministic scripted Net mock used by protocol unit tests.
 pub const MockNet = struct {
+    /// Scripted control-accept behavior consumed one entry per `acceptControl` call.
+    control_accept_script: []const AcceptOp = &.{},
+    control_accept_index: usize = 0,
+
     /// Scripted read behavior consumed one entry per `read` call.
     read_script: []const ReadOp = &.{},
     read_index: usize = 0,
@@ -15,6 +19,10 @@ pub const MockNet = struct {
     write_capture: [8192]u8 = undefined,
     write_capture_len: usize = 0,
 
+    /// Captured control/data connection ids passed to `closeConn`.
+    closed_conn_ids: [64]u16 = undefined,
+    closed_conn_len: usize = 0,
+
     /// Address type used by the mock.
     pub const Address = struct {
         ip: [4]u8 = .{ 127, 0, 0, 1 },
@@ -22,11 +30,24 @@ pub const MockNet = struct {
     };
 
     /// Placeholder listener type for control connections.
-    pub const ControlListener = struct {};
+    pub const ControlListener = struct {
+        owner: *MockNet,
+    };
     /// Placeholder data listener type for PASV.
-    pub const PasvListener = struct {};
+    pub const PasvListener = struct {
+        owner: *MockNet,
+    };
     /// Placeholder connection type.
-    pub const Conn = struct {};
+    pub const Conn = struct {
+        id: u16 = 0,
+    };
+
+    /// Scripted behavior for one accept call.
+    pub const AcceptOp = union(enum) {
+        conn: u16,
+        none,
+        would_block,
+    };
 
     /// Scripted behavior for one `read` call.
     pub const ReadOp = union(enum) {
@@ -54,16 +75,27 @@ pub const MockNet = struct {
         self.write_index = 0;
     }
 
-    pub fn controlListen(_: *MockNet, _: Address) interfaces_net.NetError!ControlListener {
-        return .{};
+    pub fn controlListen(self: *MockNet, _: Address) interfaces_net.NetError!ControlListener {
+        return .{ .owner = self };
     }
 
-    pub fn acceptControl(_: *ControlListener) interfaces_net.NetError!?Conn {
-        return null;
+    pub fn acceptControl(listener: *ControlListener) interfaces_net.NetError!?Conn {
+        const self = listener.owner;
+        if (self.control_accept_index >= self.control_accept_script.len) {
+            return null;
+        }
+
+        const op = self.control_accept_script[self.control_accept_index];
+        self.control_accept_index += 1;
+        return switch (op) {
+            .conn => |id| .{ .id = id },
+            .none => null,
+            .would_block => error.WouldBlock,
+        };
     }
 
-    pub fn pasvListen(_: *MockNet, _: interfaces_net.PasvBindHint(Address)) interfaces_net.NetError!PasvListener {
-        return .{};
+    pub fn pasvListen(self: *MockNet, _: interfaces_net.PasvBindHint(Address)) interfaces_net.NetError!PasvListener {
+        return .{ .owner = self };
     }
 
     pub fn pasvLocalAddr(_: *PasvListener) interfaces_net.NetError!Address {
@@ -123,7 +155,11 @@ pub const MockNet = struct {
         return accepted;
     }
 
-    pub fn closeConn(_: *Conn) void {}
+    pub fn closeConn(self: *MockNet, conn: *const Conn) void {
+        if (self.closed_conn_len >= self.closed_conn_ids.len) return;
+        self.closed_conn_ids[self.closed_conn_len] = conn.id;
+        self.closed_conn_len += 1;
+    }
 };
 
 const testing = std.testing;

@@ -2,6 +2,7 @@ const std = @import("std");
 const limits = @import("limits.zig");
 const interfaces_net = @import("interfaces_net.zig");
 const interfaces_fs = @import("interfaces_fs.zig");
+const session_mod = @import("session.zig");
 
 /// Size configuration for the core buffers.
 pub const Buffers = struct {
@@ -39,11 +40,8 @@ pub const Config = struct {
     timeouts: ?Timeouts = null,
 };
 
-/// Opaque placeholder for the session state (populated in later milestones).
-pub const Session = struct {
-    /// Reserved for future session state.
-    _reserved: u8 = 0,
-};
+/// Per-session state used by the control state machine.
+pub const Session = session_mod.Session;
 
 /// Caller-owned storage for the core buffers and session state.
 pub const Storage = struct {
