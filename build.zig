@@ -21,6 +21,12 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/cli/main.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{
+                .name = "ftp_server",
+                .module = mod,
+            },
+        },
     });
 
     const cli_exe = b.addExecutable(.{

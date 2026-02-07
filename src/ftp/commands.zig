@@ -30,7 +30,7 @@ pub fn parse(line: []const u8) Parsed {
 
     const cmd_end = std.mem.indexOfScalar(u8, trimmed, ' ') orelse trimmed.len;
     const cmd_text = trimmed[0..cmd_end];
-    const arg_text = std.mem.trimLeft(u8, trimmed[cmd_end..], " ");
+    const arg_text = std.mem.trim(u8, trimmed[cmd_end..], " ");
 
     return .{
         .command = parseCommand(cmd_text),

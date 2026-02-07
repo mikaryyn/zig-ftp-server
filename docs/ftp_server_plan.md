@@ -18,7 +18,7 @@ This repository must also include a runnable CLI harness that wires the library 
 - [x] (2026-02-07 20:44Z) Milestone 3: Control-channel CRLF line reader + reply writer (non-blocking) with unit tests.
 - [x] (2026-02-07 20:53Z) Milestone 4: Session state machine + auth + basic commands (`USER`, `PASS`, `QUIT`, `NOOP`, `SYST`, `TYPE`, `FEAT`) with mock-net tests.
 - [x] (2026-02-07 21:03Z) Milestone 5: Fs interface usage + navigation commands (`PWD`, `CWD`, `CDUP`) with mock-fs tests.
-- [ ] Milestone 6: CLI harness (`NetStd` + `VfsOs`) wired to core + manual “login and PWD” smoke test.
+- [x] (2026-02-07 22:05Z) Milestone 6: CLI harness (`NetStd` + `VfsOs`) wired to core + manual “login and PWD” smoke test.
 - [ ] Milestone 7: PASV lifecycle + data accept plumbing + `PASV` command with tests and manual smoke test.
 - [ ] Milestone 8: `LIST` streaming implementation with tests and manual smoke test.
 - [ ] Milestone 9: `RETR` streaming download with tests and manual smoke test.
@@ -31,6 +31,9 @@ This repository must also include a runnable CLI harness that wires the library 
 
 - Observation: Local `zig build test` used Zig 0.15.2, and the existing `build.zig.zon` fingerprint failed validation.
   Evidence: Build error: "invalid fingerprint: 0xddc27b248372ca1d; ... use this value: 0x5ef2039982c339".
+
+- Observation: CLI code paths written for newer Zig APIs (`std.process.Init`, direct parent-path imports from `src/cli/*`) failed under Zig 0.15.2 module boundaries.
+  Evidence: `zig build` errors included "root source file struct 'process' has no member named 'Init'" and "import of file outside module path".
 
 ## Decision Log
 
@@ -65,6 +68,7 @@ This repository must also include a runnable CLI harness that wires the library 
 - Milestone 3 delivered `src/ftp/control.zig` (non-blocking CRLF line reader with long-line discard), `src/ftp/replies.zig` (fixed-buffer reply formatter + resumable partial-writes), and `src/ftp/mock_net.zig` (deterministic partial I/O / `WouldBlock` scripts), with unit tests covering split CRLF, multi-line buffering, empty lines, long-line handling, FEAT formatting, and partial-write flushing.
 - Milestone 4 delivered `src/ftp/commands.zig`, `src/ftp/session.zig`, and `src/ftp/server.zig` with a non-blocking single-session `tick()` driver implementing `USER`, `PASS`, `QUIT`, `NOOP`, `SYST`, `TYPE`, and `FEAT`; `src/ftp/mock_net.zig` was extended with scripted control accepts so tests now cover full login command sequencing and `421` rejection of concurrent control connections.
 - Milestone 5 delivered `PWD`/`CWD`/`CDUP` wired to `Fs.cwdPwd`/`Fs.cwdChange`/`Fs.cwdUp`, session CWD initialization during login, `src/ftp/mock_vfs.zig` in-memory navigation tests, `src/ftp/transfer.zig` placeholder state, and validated VFS error-to-reply mapping (`550`/`553`/`451`) under `zig build test`.
+- Milestone 6 delivered a full CLI harness wired to the protocol core: `src/cli/main.zig` now runs the `FtpServer` tick loop with `--listen`/`--root`/`--user`/`--pass`, `src/cli/net_std.zig` satisfies the compile-time `Net` interface for control-channel operation using non-blocking `std.net`, and `src/cli/vfs_os.zig` provides a rooted OS-backed `Fs` implementation for `cwd` operations with path normalization and NUL-byte rejection. Manual smoke validation with `./zig-out/bin/ftp-server` + `nc` confirmed the expected `220`/`331`/`230`/`257`/`221` sequence.
 
 ## Context and Orientation
 
@@ -310,3 +314,4 @@ Plan Update Notes (2026-02-07): Reordered milestones to deliver a minimal runnab
 Plan Update Notes (2026-02-07): Completed Milestone 3 and added control/reply/mock-net modules with non-blocking unit coverage for boundary and partial-I/O cases.
 Plan Update Notes (2026-02-07): Completed Milestone 4 by adding command parsing, session/auth state, and a non-blocking server tick with tests for login sequencing and second-connection `421` refusal.
 Plan Update Notes (2026-02-07): Completed Milestone 5 by adding filesystem-backed navigation commands (`PWD`, `CWD`, `CDUP`), in-memory mock VFS coverage, and reply mapping tests for filesystem errors.
+Plan Update Notes (2026-02-07): Completed Milestone 6 by wiring the real CLI harness (`main` + `NetStd` + rooted `VfsOs`) to the core server, fixing Zig 0.15.2 compatibility issues in argument/module wiring, and validating a manual login+PWD smoke test transcript.
