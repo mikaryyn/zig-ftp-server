@@ -70,5 +70,4 @@ pub fn validate(comptime Fs: type) void {
 
     if (!@hasDecl(Fs, "delete")) missing.fnDecl("delete");
     if (!@hasDecl(Fs, "rename")) missing.fnDecl("rename");
-
 }

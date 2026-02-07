@@ -16,7 +16,11 @@ pub const VfsOs = struct {
 
     pub const FileReader = struct {};
     pub const FileWriter = struct {};
-    pub const DirIter = struct {};
+    pub const DirIter = struct {
+        dir: std.Io.Dir,
+        iter: std.Io.Dir.Iterator,
+        name_buf: [std.Io.Dir.max_name_bytes]u8 = undefined,
+    };
 
     pub fn init(io: std.Io, root_path: []const u8) !VfsOs {
         var dir = try std.Io.Dir.cwd().openDir(io, root_path, .{});
@@ -58,15 +62,53 @@ pub const VfsOs = struct {
         try self.cwdChange(cwd, "..");
     }
 
-    pub fn dirOpen(_: *VfsOs, _: *const Cwd, _: ?[]const u8) interfaces_fs.FsError!DirIter {
-        return error.Unsupported;
+    pub fn dirOpen(self: *VfsOs, cwd: *const Cwd, path: ?[]const u8) interfaces_fs.FsError!DirIter {
+        var target_buf: [max_path_len]u8 = undefined;
+        const target = if (path) |p|
+            try normalizePath(cwd, p, target_buf[0..])
+        else blk: {
+            if (cwd.len > target_buf.len) return error.InvalidPath;
+            std.mem.copyForwards(u8, target_buf[0..cwd.len], cwd.path[0..cwd.len]);
+            break :blk target_buf[0..cwd.len];
+        };
+
+        var rel_buf: [max_path_len]u8 = undefined;
+        const rel_path = try toRelative(target, rel_buf[0..]);
+        var dir = self.root_dir.openDir(self.io, rel_path, .{ .iterate = true }) catch |err| return mapFsError(err);
+        errdefer dir.close(self.io);
+
+        return .{
+            .dir = dir,
+            .iter = dir.iterateAssumeFirstIteration(),
+        };
     }
 
-    pub fn dirNext(_: *VfsOs, _: *DirIter) interfaces_fs.FsError!?interfaces_fs.DirEntry {
-        return error.Unsupported;
+    pub fn dirNext(self: *VfsOs, iter: *DirIter) interfaces_fs.FsError!?interfaces_fs.DirEntry {
+        while (true) {
+            const os_entry = iter.iter.next(self.io) catch |err| return mapFsError(err);
+            if (os_entry == null) return null;
+
+            const entry = os_entry.?;
+            if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+            if (entry.name.len > iter.name_buf.len) return error.InvalidPath;
+            std.mem.copyForwards(u8, iter.name_buf[0..entry.name.len], entry.name);
+
+            const kind: interfaces_fs.PathKind = switch (entry.kind) {
+                .directory => .dir,
+                else => .file,
+            };
+            return .{
+                .name = iter.name_buf[0..entry.name.len],
+                .kind = kind,
+                .size = null,
+                .mtime_unix = null,
+            };
+        }
     }
 
-    pub fn dirClose(_: *VfsOs, _: *DirIter) void {}
+    pub fn dirClose(self: *VfsOs, iter: *DirIter) void {
+        iter.dir.close(self.io);
+    }
 
     pub fn openRead(_: *VfsOs, _: *const Cwd, _: []const u8) interfaces_fs.FsError!FileReader {
         return error.Unsupported;

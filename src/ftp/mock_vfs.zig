@@ -15,7 +15,10 @@ pub const MockVfs = struct {
 
     pub const FileReader = struct {};
     pub const FileWriter = struct {};
-    pub const DirIter = struct {};
+    pub const DirIter = struct {
+        entries: []const interfaces_fs.DirEntry = &.{},
+        index: usize = 0,
+    };
 
     /// Initialize to root (`/`).
     pub fn cwdInit(_: *MockVfs) interfaces_fs.FsError!Cwd {
@@ -104,12 +107,23 @@ pub const MockVfs = struct {
         try self.cwdChange(cwd, "..");
     }
 
-    pub fn dirOpen(_: *MockVfs, _: *const Cwd, _: ?[]const u8) interfaces_fs.FsError!DirIter {
-        return error.Unsupported;
+    pub fn dirOpen(self: *MockVfs, cwd: *const Cwd, path: ?[]const u8) interfaces_fs.FsError!DirIter {
+        var path_buf: [128]u8 = undefined;
+        const target = try self.resolveDirPath(cwd, path, path_buf[0..]);
+        const entries = entriesFor(target) orelse {
+            if (isKnownFile(target)) return error.NotDir;
+            return error.NotFound;
+        };
+        return .{
+            .entries = entries,
+        };
     }
 
-    pub fn dirNext(_: *MockVfs, _: *DirIter) interfaces_fs.FsError!?interfaces_fs.DirEntry {
-        return error.Unsupported;
+    pub fn dirNext(_: *MockVfs, iter: *DirIter) interfaces_fs.FsError!?interfaces_fs.DirEntry {
+        if (iter.index >= iter.entries.len) return null;
+        const entry = iter.entries[iter.index];
+        iter.index += 1;
+        return entry;
     }
 
     pub fn dirClose(_: *MockVfs, _: *DirIter) void {}
@@ -152,6 +166,42 @@ pub const MockVfs = struct {
     fn isKnownFile(path: []const u8) bool {
         return std.mem.eql(u8, path, "/readme.txt");
     }
+
+    fn resolveDirPath(self: *MockVfs, cwd: *const Cwd, path: ?[]const u8, out: []u8) interfaces_fs.FsError![]const u8 {
+        if (path) |raw| {
+            if (raw.len == 0) return cwd.asSlice();
+            var temp = cwd.*;
+            try self.cwdChange(&temp, raw);
+            if (temp.len > out.len) return error.InvalidPath;
+            std.mem.copyForwards(u8, out[0..temp.len], temp.path[0..temp.len]);
+            return out[0..temp.len];
+        }
+        if (cwd.len > out.len) return error.InvalidPath;
+        std.mem.copyForwards(u8, out[0..cwd.len], cwd.path[0..cwd.len]);
+        return out[0..cwd.len];
+    }
+
+    fn entriesFor(path: []const u8) ?[]const interfaces_fs.DirEntry {
+        if (std.mem.eql(u8, path, "/")) return root_entries[0..];
+        if (std.mem.eql(u8, path, "/pub")) return pub_entries[0..];
+        if (std.mem.eql(u8, path, "/docs")) return docs_entries[0..];
+        if (std.mem.eql(u8, path, "/pub/nested")) return nested_entries[0..];
+        return null;
+    }
+
+    const root_entries = [_]interfaces_fs.DirEntry{
+        .{ .name = "docs", .kind = .dir },
+        .{ .name = "pub", .kind = .dir },
+        .{ .name = "readme.txt", .kind = .file, .size = 123 },
+    };
+    const pub_entries = [_]interfaces_fs.DirEntry{
+        .{ .name = "nested", .kind = .dir },
+        .{ .name = "upload.txt", .kind = .file, .size = 17 },
+    };
+    const docs_entries = [_]interfaces_fs.DirEntry{
+        .{ .name = "guide.md", .kind = .file, .size = 64 },
+    };
+    const nested_entries = [_]interfaces_fs.DirEntry{};
 };
 
 const testing = std.testing;
@@ -181,4 +231,25 @@ test "mock vfs reports known navigation errors" {
     try testing.expectError(error.NotDir, vfs.cwdChange(&cwd, "/readme.txt"));
     try testing.expectError(error.PermissionDenied, vfs.cwdChange(&cwd, "locked"));
     try testing.expectError(error.Io, vfs.cwdChange(&cwd, "ioerr"));
+}
+
+test "mock vfs directory iterator returns deterministic entries" {
+    var vfs: MockVfs = .{};
+    var cwd = try vfs.cwdInit();
+
+    var iter = try vfs.dirOpen(&cwd, null);
+    defer vfs.dirClose(&iter);
+
+    const first = (try vfs.dirNext(&iter)).?;
+    try testing.expect(std.mem.eql(u8, "docs", first.name));
+    try testing.expectEqual(interfaces_fs.PathKind.dir, first.kind);
+
+    const second = (try vfs.dirNext(&iter)).?;
+    try testing.expect(std.mem.eql(u8, "pub", second.name));
+
+    const third = (try vfs.dirNext(&iter)).?;
+    try testing.expect(std.mem.eql(u8, "readme.txt", third.name));
+    try testing.expectEqual(@as(?u64, 123), third.size);
+
+    try testing.expectEqual(@as(?interfaces_fs.DirEntry, null), try vfs.dirNext(&iter));
 }

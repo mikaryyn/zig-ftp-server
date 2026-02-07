@@ -6,4 +6,3 @@ pub const State = enum {
     Transferring,
     DataClosing,
 };
-

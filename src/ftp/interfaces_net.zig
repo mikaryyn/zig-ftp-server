@@ -52,5 +52,4 @@ pub fn validate(comptime Net: type) void {
     if (!@hasDecl(Net, "read")) missing.fnDecl("read");
     if (!@hasDecl(Net, "write")) missing.fnDecl("write");
     if (!@hasDecl(Net, "closeConn")) missing.fnDecl("closeConn");
-
 }

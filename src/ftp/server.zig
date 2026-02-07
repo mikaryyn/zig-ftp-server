@@ -6,9 +6,10 @@ const replies = @import("replies.zig");
 const commands = @import("commands.zig");
 const session_mod = @import("session.zig");
 const misc = @import("misc.zig");
+const transfer = @import("transfer.zig");
 const mock_vfs = @import("mock_vfs.zig");
 
-/// Single-session FTP server core for Milestone 5.
+/// Single-session FTP server core with PASV and LIST support.
 pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
     interfaces_net.validate(Net);
     interfaces_fs.validate(Fs);
@@ -28,6 +29,8 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
         cwd: ?Fs.Cwd = null,
         pasv_listener: ?Net.PasvListener = null,
         data_conn: ?Net.Conn = null,
+        list_iter: ?Fs.DirIter = null,
+        list_transfer: transfer.ListTransfer = .{},
 
         pub fn initNoHeap(
             net: *Net,
@@ -61,9 +64,11 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
 
             try self.flushReplies();
             try self.pollPasvAccept();
+            try self.driveListTransfer();
 
             if (self.control_conn == null) return;
             if (self.reply_writer.isPending()) return;
+            if (self.list_transfer.state != .idle) return;
 
             if (self.session.auth_state == .Closing) {
                 self.closeControlConn();
@@ -100,8 +105,9 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
             self.control_conn = maybe_conn.?;
             self.session.* = .{};
             self.cwd = null;
-            self.pasv_listener = null;
-            self.data_conn = null;
+            self.closePassiveResources();
+            self.closeListIter();
+            self.list_transfer.reset();
             self.line_reader = control.LineReader(Net).init(self.storage.command_buf);
             self.reply_writer = replies.ReplyWriter(Net).init(self.storage.reply_buf);
             try self.queueLine(220, self.config.banner);
@@ -146,7 +152,8 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
                 .type_ => try self.handleType(parsed.argument),
                 .feat => try self.queueFeat(),
                 .pasv => try self.handlePasv(),
-                .list, .retr, .stor => try self.handleTransferCommand(),
+                .list => try self.handleList(parsed.argument),
+                .retr, .stor => try self.handleTransferCommand(),
                 .pwd => try self.handlePwd(),
                 .cwd => try self.handleCwd(parsed.argument),
                 .cdup => try self.handleCdup(),
@@ -217,9 +224,12 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
 
         fn handleType(self: *Self, arg: []const u8) interfaces_net.NetError!void {
             const trimmed = std.mem.trim(u8, arg, " ");
-            if (std.ascii.eqlIgnoreCase(trimmed, "I") or std.ascii.eqlIgnoreCase(trimmed, "A")) {
+            if (std.ascii.eqlIgnoreCase(trimmed, "I")) {
                 self.session.transfer_type = .binary;
                 try self.queueLine(200, "Type set to I");
+            } else if (std.ascii.eqlIgnoreCase(trimmed, "A")) {
+                self.session.transfer_type = .binary;
+                try self.queueLine(200, "Type set to A");
             } else {
                 try self.queueLine(504, "Command not implemented for that parameter");
             }
@@ -289,6 +299,8 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
         }
 
         fn handlePasv(self: *Self) interfaces_net.NetError!void {
+            self.closeListIter();
+            self.list_transfer.reset();
             self.closePassiveResources();
 
             const listener = self.net.pasvListen(.{}) catch {
@@ -327,6 +339,31 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
             try self.queueLine(227, msg);
         }
 
+        fn handleList(self: *Self, arg: []const u8) interfaces_net.NetError!void {
+            if (self.session.pasv_state == .PasvIdle) {
+                try self.queueLine(425, "Use PASV first");
+                return;
+            }
+
+            const cwd = self.requireCwd() orelse {
+                try self.queueLine(451, "Requested action aborted: local error in processing");
+                return;
+            };
+
+            const trimmed = std.mem.trim(u8, arg, " ");
+            const opt_path: ?[]const u8 = if (trimmed.len == 0) null else trimmed;
+            const iter = self.fs.dirOpen(cwd, opt_path) catch |err| {
+                try self.queueFsError(err);
+                return;
+            };
+
+            self.closeListIter();
+            self.list_iter = iter;
+            self.list_transfer = .{
+                .state = .list_waiting_accept,
+            };
+        }
+
         fn handleTransferCommand(self: *Self) interfaces_net.NetError!void {
             if (self.session.pasv_state == .PasvIdle) {
                 try self.queueLine(425, "Use PASV first");
@@ -354,6 +391,99 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
 
             self.data_conn = maybe_data.?;
             self.session.pasv_state = .DataConnected;
+        }
+
+        fn driveListTransfer(self: *Self) interfaces_net.NetError!void {
+            if (self.list_transfer.state == .idle) return;
+            if (self.reply_writer.isPending()) return;
+
+            if (self.data_conn == null) {
+                if (self.session.pasv_state == .PasvListening) return;
+                try self.abortListTransfer(425, "Can't open data connection");
+                return;
+            }
+
+            if (self.list_transfer.state == .list_waiting_accept) {
+                try self.queueLine(150, "Here comes the directory listing");
+                self.list_transfer.state = .list_streaming;
+                self.session.pasv_state = .Transferring;
+                return;
+            }
+
+            if (self.list_transfer.line_off < self.list_transfer.line_len) {
+                try self.flushListLine();
+                return;
+            }
+
+            if (self.list_transfer.exhausted) {
+                try self.finishListTransfer();
+                return;
+            }
+
+            if (self.list_iter == null) {
+                try self.abortListTransfer(451, "Requested action aborted: local error in processing");
+                return;
+            }
+            const entry_opt = self.fs.dirNext(&self.list_iter.?) catch |err| {
+                try self.abortListFsError(err);
+                return;
+            };
+            if (entry_opt == null) {
+                self.list_transfer.exhausted = true;
+                try self.finishListTransfer();
+                return;
+            }
+
+            const line = transfer.formatListEntry(self.storage.transfer_buf, entry_opt.?) catch {
+                try self.abortListTransfer(451, "Requested action aborted: local error in processing");
+                return;
+            };
+            self.list_transfer.line_len = line.len;
+            self.list_transfer.line_off = 0;
+            try self.flushListLine();
+        }
+
+        fn flushListLine(self: *Self) interfaces_net.NetError!void {
+            if (self.data_conn == null) {
+                try self.abortListTransfer(426, "Connection closed; transfer aborted");
+                return;
+            }
+            const pending = self.storage.transfer_buf[self.list_transfer.line_off..self.list_transfer.line_len];
+            const wrote = self.net.write(&self.data_conn.?, pending) catch |err| switch (err) {
+                error.WouldBlock => return,
+                else => {
+                    try self.abortListTransfer(426, "Connection closed; transfer aborted");
+                    return;
+                },
+            };
+            if (wrote == 0) {
+                try self.abortListTransfer(426, "Connection closed; transfer aborted");
+                return;
+            }
+            self.list_transfer.line_off += wrote;
+            if (self.list_transfer.line_off >= self.list_transfer.line_len) {
+                self.list_transfer.line_off = 0;
+                self.list_transfer.line_len = 0;
+            }
+        }
+
+        fn finishListTransfer(self: *Self) interfaces_net.NetError!void {
+            self.closeListIter();
+            self.list_transfer.reset();
+            self.closePassiveResources();
+            try self.queueLine(226, "Directory send OK");
+        }
+
+        fn abortListFsError(self: *Self, err: interfaces_fs.FsError) interfaces_net.NetError!void {
+            const mapped = mapFsError(err);
+            try self.abortListTransfer(mapped.code, mapped.text);
+        }
+
+        fn abortListTransfer(self: *Self, code: u16, text: []const u8) interfaces_net.NetError!void {
+            self.closeListIter();
+            self.list_transfer.reset();
+            self.closePassiveResources();
+            try self.queueLine(code, text);
         }
 
         fn requireCwd(self: *Self) ?*Fs.Cwd {
@@ -392,7 +522,16 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
             self.session.pasv_state = .PasvIdle;
         }
 
+        fn closeListIter(self: *Self) void {
+            if (self.list_iter) |*iter| {
+                self.fs.dirClose(iter);
+            }
+            self.list_iter = null;
+        }
+
         fn closeControlConn(self: *Self) void {
+            self.closeListIter();
+            self.list_transfer.reset();
             self.closePassiveResources();
             if (self.control_conn) |*conn| {
                 self.net.closeConn(conn);
@@ -429,13 +568,15 @@ const MockFs = struct {
     pub fn cwdUp(self: *MockFs, cwd: *Cwd) interfaces_fs.FsError!void {
         try self.vfs.cwdUp(cwd);
     }
-    pub fn dirOpen(_: *MockFs, _: *const Cwd, _: ?[]const u8) interfaces_fs.FsError!DirIter {
-        return .{};
+    pub fn dirOpen(self: *MockFs, cwd: *const Cwd, path: ?[]const u8) interfaces_fs.FsError!DirIter {
+        return self.vfs.dirOpen(cwd, path);
     }
-    pub fn dirNext(_: *MockFs, _: *DirIter) interfaces_fs.FsError!?interfaces_fs.DirEntry {
-        return null;
+    pub fn dirNext(self: *MockFs, iter: *DirIter) interfaces_fs.FsError!?interfaces_fs.DirEntry {
+        return self.vfs.dirNext(iter);
     }
-    pub fn dirClose(_: *MockFs, _: *DirIter) void {}
+    pub fn dirClose(self: *MockFs, iter: *DirIter) void {
+        self.vfs.dirClose(iter);
+    }
     pub fn openRead(_: *MockFs, _: *const Cwd, _: []const u8) interfaces_fs.FsError!FileReader {
         return .{};
     }
@@ -620,6 +761,111 @@ test "server requires PASV before LIST RETR STOR" {
     try testing.expectEqual(@as(usize, 3), std.mem.count(u8, written, expected));
 }
 
+test "server LIST waits for PASV data accept before 150" {
+    var net: mock_net.MockNet = .{
+        .control_accept_script = &.{
+            .{ .conn = 1 },
+        },
+        .data_accept_script = &.{
+            .none,
+            .none,
+            .{ .conn = 8 },
+        },
+        .read_script = &.{
+            .{ .bytes = "USER test\r\nPASS secret\r\nPASV\r\nLIST\r\nQUIT\r\n" },
+        },
+    };
+    var fs: MockFs = .{};
+    const listener = try net.controlListen(.{});
+
+    var cmd_buf: [limits.command_max]u8 = undefined;
+    var reply_buf: [limits.reply_max]u8 = undefined;
+    var transfer_buf: [limits.transfer_max]u8 = undefined;
+    var scratch_buf: [limits.scratch_max]u8 = undefined;
+    var storage = misc.Storage.init(cmd_buf[0..], reply_buf[0..], transfer_buf[0..], scratch_buf[0..]);
+    storage.session = .{};
+
+    const Server = FtpServer(mock_net.MockNet, MockFs);
+    var server = Server.initNoHeap(&net, &fs, listener, .{
+        .user = "test",
+        .password = "secret",
+    }, &storage);
+
+    var i: usize = 0;
+    while (i < 6) : (i += 1) {
+        try server.tick(0);
+    }
+    try testing.expect(std.mem.indexOf(u8, net.written(), "150 Here comes the directory listing\r\n") == null);
+
+    while (i < 24) : (i += 1) {
+        try server.tick(0);
+    }
+    const written = net.written();
+    const idx_150 = std.mem.indexOf(u8, written, "150 Here comes the directory listing\r\n") orelse return error.UnexpectedTestResult;
+    const idx_226 = std.mem.indexOf(u8, written, "226 Directory send OK\r\n") orelse return error.UnexpectedTestResult;
+    try testing.expect(idx_150 < idx_226);
+}
+
+test "server LIST streams lines with CRLF and partial data writes" {
+    var net: mock_net.MockNet = .{
+        .control_accept_script = &.{
+            .{ .conn = 1 },
+        },
+        .data_accept_script = &.{
+            .{ .conn = 9 },
+        },
+        .write_script = &.{
+            .{ .accept = 1024 }, // 220
+            .{ .accept = 1024 }, // 331
+            .{ .accept = 1024 }, // 230
+            .{ .accept = 1024 }, // 227
+            .{ .accept = 1024 }, // 150
+            .{ .accept = 5 }, // first LIST line partial
+            .would_block,
+            .{ .accept = 1024 }, // first line remainder
+            .{ .accept = 7 }, // second line partial
+            .{ .accept = 1024 }, // second line remainder
+            .{ .accept = 1024 }, // third line
+            .{ .accept = 1024 }, // 226
+            .{ .accept = 1024 }, // 221
+        },
+        .read_script = &.{
+            .{ .bytes = "USER test\r\nPASS secret\r\nPASV\r\nLIST\r\nQUIT\r\n" },
+        },
+    };
+    var fs: MockFs = .{};
+    const listener = try net.controlListen(.{});
+
+    var cmd_buf: [limits.command_max]u8 = undefined;
+    var reply_buf: [limits.reply_max]u8 = undefined;
+    var transfer_buf: [limits.transfer_max]u8 = undefined;
+    var scratch_buf: [limits.scratch_max]u8 = undefined;
+    var storage = misc.Storage.init(cmd_buf[0..], reply_buf[0..], transfer_buf[0..], scratch_buf[0..]);
+    storage.session = .{};
+
+    const Server = FtpServer(mock_net.MockNet, MockFs);
+    var server = Server.initNoHeap(&net, &fs, listener, .{
+        .user = "test",
+        .password = "secret",
+    }, &storage);
+
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        try server.tick(0);
+    }
+
+    const written = net.written();
+    try testing.expect(std.mem.indexOf(u8, written, "150 Here comes the directory listing\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "226 Directory send OK\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "drwxr-xr-x 1 owner group 0 Jan 01 00:00 docs\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "drwxr-xr-x 1 owner group 0 Jan 01 00:00 pub\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "-rw-r--r-- 1 owner group 123 Jan 01 00:00 readme.txt\r\n") != null);
+    try testing.expectEqual(@as(usize, 2), net.closed_listener_len);
+    try testing.expectEqual(@as(usize, 2), net.closed_conn_len);
+    try testing.expectEqual(@as(u16, 9), net.closed_conn_ids[0]);
+    try testing.expectEqual(@as(u16, 1), net.closed_conn_ids[1]);
+}
+
 test "server handles PWD CWD and CDUP" {
     var net: mock_net.MockNet = .{
         .control_accept_script = &.{
@@ -697,4 +943,37 @@ test "server maps CWD fs errors to replies" {
     try testing.expect(std.mem.indexOf(u8, net.written(), "550 File not found\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, net.written(), "550 Permission denied\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, net.written(), "451 Requested action aborted: local error in processing\r\n") != null);
+}
+
+test "server TYPE A returns matching reply text" {
+    var net: mock_net.MockNet = .{
+        .control_accept_script = &.{
+            .{ .conn = 1 },
+        },
+        .read_script = &.{
+            .{ .bytes = "USER test\r\nPASS secret\r\nTYPE A\r\nQUIT\r\n" },
+        },
+    };
+    var fs: MockFs = .{};
+    const listener = try net.controlListen(.{});
+
+    var cmd_buf: [limits.command_max]u8 = undefined;
+    var reply_buf: [limits.reply_max]u8 = undefined;
+    var transfer_buf: [limits.transfer_max]u8 = undefined;
+    var scratch_buf: [limits.scratch_max]u8 = undefined;
+    var storage = misc.Storage.init(cmd_buf[0..], reply_buf[0..], transfer_buf[0..], scratch_buf[0..]);
+    storage.session = .{};
+
+    const Server = FtpServer(mock_net.MockNet, MockFs);
+    var server = Server.initNoHeap(&net, &fs, listener, .{
+        .user = "test",
+        .password = "secret",
+    }, &storage);
+
+    var i: usize = 0;
+    while (i < 16) : (i += 1) {
+        try server.tick(0);
+    }
+
+    try testing.expect(std.mem.indexOf(u8, net.written(), "200 Type set to A\r\n") != null);
 }
