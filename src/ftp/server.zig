@@ -39,6 +39,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
         retr_transfer: transfer.RetrTransfer = .{},
         file_writer: ?Fs.FileWriter = null,
         stor_transfer: transfer.StorTransfer = .{},
+        now_millis: u64 = 0,
 
         pub fn initNoHeap(
             net: *Net,
@@ -62,7 +63,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
 
         /// Drive one bounded, non-blocking server tick.
         pub fn tick(self: *Self, now_millis: u64) interfaces_net.NetError!void {
-            _ = now_millis;
+            self.now_millis = now_millis;
 
             if (self.control_conn == null) {
                 try self.acceptPrimaryConn();
@@ -75,6 +76,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
             try self.driveListTransfer();
             try self.driveRetrTransfer();
             try self.driveStorTransfer();
+            self.enforceTimeouts();
 
             if (self.control_conn == null) return;
             if (self.reply_writer.isPending()) return;
@@ -88,6 +90,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
             }
 
             const conn = &self.control_conn.?;
+            const before_len = self.line_reader.len;
             const event = self.line_reader.poll(self.net, conn) catch |err| switch (err) {
                 error.WouldBlock => return,
                 error.Closed => {
@@ -96,11 +99,18 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
                 },
                 else => return err,
             };
+            if (self.line_reader.len > before_len) {
+                self.markControlActivity();
+            }
 
             switch (event) {
                 .none => return,
-                .too_long => try self.queueLine(500, "Line too long"),
+                .too_long => {
+                    self.markControlActivity();
+                    try self.queueLine(500, "Line too long");
+                },
                 .line => |line| {
+                    self.markControlActivity();
                     if (line.len == 0) return;
                     try self.handleCommand(commands.parse(line));
                 },
@@ -126,6 +136,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
             self.stor_transfer.reset();
             self.line_reader = control.LineReader(Net).init(self.storage.command_buf);
             self.reply_writer = replies.ReplyWriter(Net).init(self.storage.reply_buf);
+            self.markControlActivity();
             try self.queueLine(220, self.config.banner);
         }
 
@@ -146,7 +157,11 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
             if (self.control_conn == null) return;
 
             const conn = &self.control_conn.?;
+            const before = self.reply_writer.offset;
             _ = try self.reply_writer.flush(self.net, conn);
+            if (self.reply_writer.offset > before or !self.reply_writer.isPending()) {
+                self.markControlActivity();
+            }
         }
 
         fn handleCommand(self: *Self, parsed: commands.Parsed) interfaces_net.NetError!void {
@@ -313,6 +328,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
                 try self.queueLine(501, "Syntax error in parameters or arguments");
                 return;
             }
+            if (!try self.validatePathArg(trimmed)) return;
 
             const cwd = self.requireCwd() orelse {
                 try self.queueLine(451, "Requested action aborted: local error in processing");
@@ -379,6 +395,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
                 try self.queueLine(451, "Requested action aborted: local error in processing");
                 return;
             };
+            self.session.pasv_opened_ms = self.now_millis;
             try self.queueLine(227, msg);
         }
 
@@ -394,6 +411,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
             };
 
             const trimmed = std.mem.trim(u8, arg, " ");
+            if (trimmed.len > 0 and !try self.validatePathArg(trimmed)) return;
             const opt_path: ?[]const u8 = if (trimmed.len == 0) null else trimmed;
             const iter = self.fs.dirOpen(cwd, opt_path) catch |err| {
                 try self.queueFsError(err);
@@ -418,6 +436,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
                 try self.queueLine(501, "Syntax error in parameters or arguments");
                 return;
             }
+            if (!try self.validatePathArg(path)) return;
 
             const cwd = self.requireCwd() orelse {
                 try self.queueLine(451, "Requested action aborted: local error in processing");
@@ -446,6 +465,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
                 try self.queueLine(501, "Syntax error in parameters or arguments");
                 return;
             }
+            if (!try self.validatePathArg(path)) return;
 
             const cwd = self.requireCwd() orelse {
                 try self.queueLine(451, "Requested action aborted: local error in processing");
@@ -469,6 +489,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
                 try self.queueLine(501, "Syntax error in parameters or arguments");
                 return;
             }
+            if (!try self.validatePathArg(path)) return;
 
             const cwd = self.requireCwd() orelse {
                 try self.queueLine(451, "Requested action aborted: local error in processing");
@@ -487,10 +508,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
                 try self.queueLine(501, "Syntax error in parameters or arguments");
                 return;
             }
-            if (path.len > self.session.rename_from.len) {
-                try self.queueLine(553, "Requested action not taken. File name not allowed");
-                return;
-            }
+            if (!try self.validatePathArg(path)) return;
 
             std.mem.copyForwards(u8, self.session.rename_from[0..path.len], path);
             self.session.rename_from_len = path.len;
@@ -508,6 +526,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
                 try self.queueLine(501, "Syntax error in parameters or arguments");
                 return;
             }
+            if (!try self.validatePathArg(to_path)) return;
 
             const cwd = self.requireCwd() orelse {
                 try self.queueLine(451, "Requested action aborted: local error in processing");
@@ -534,6 +553,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
                 try self.queueLine(501, "Syntax error in parameters or arguments");
                 return;
             }
+            if (!try self.validatePathArg(path)) return;
 
             const cwd = self.requireCwd() orelse {
                 try self.queueLine(451, "Requested action aborted: local error in processing");
@@ -566,6 +586,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
                 try self.queueLine(501, "Syntax error in parameters or arguments");
                 return;
             }
+            if (!try self.validatePathArg(path)) return;
 
             const cwd = self.requireCwd() orelse {
                 try self.queueLine(451, "Requested action aborted: local error in processing");
@@ -593,6 +614,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
                 try self.queueLine(501, "Syntax error in parameters or arguments");
                 return;
             }
+            if (!try self.validatePathArg(path)) return;
 
             const cwd = self.requireCwd() orelse {
                 try self.queueLine(451, "Requested action aborted: local error in processing");
@@ -625,6 +647,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
                 try self.queueLine(501, "Syntax error in parameters or arguments");
                 return;
             }
+            if (!try self.validatePathArg(path)) return;
 
             const cwd = self.requireCwd() orelse {
                 try self.queueLine(451, "Requested action aborted: local error in processing");
@@ -666,6 +689,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
             if (self.session.pasv_state != .PasvListening) return;
             if (self.pasv_listener == null) {
                 self.session.pasv_state = .PasvIdle;
+                self.session.pasv_opened_ms = null;
                 return;
             }
             if (self.data_conn != null) return;
@@ -681,6 +705,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
 
             self.data_conn = maybe_data.?;
             self.session.pasv_state = .DataConnected;
+            self.session.pasv_opened_ms = null;
         }
 
         fn driveListTransfer(self: *Self) interfaces_net.NetError!void {
@@ -697,6 +722,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
                 try self.queueLine(150, "Here comes the directory listing");
                 self.list_transfer.state = .list_streaming;
                 self.session.pasv_state = .Transferring;
+                self.markTransferProgress();
                 return;
             }
 
@@ -747,6 +773,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
                 try self.queueLine(150, "Opening data connection");
                 self.retr_transfer.state = .retr_streaming;
                 self.session.pasv_state = .Transferring;
+                self.markTransferProgress();
                 return;
             }
 
@@ -777,6 +804,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
 
             self.retr_transfer.chunk_len = n;
             self.retr_transfer.chunk_off = 0;
+            self.markTransferProgress();
             try self.flushRetrChunk();
         }
 
@@ -794,6 +822,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
                 try self.queueLine(150, "Opening data connection");
                 self.stor_transfer.state = .stor_streaming;
                 self.session.pasv_state = .Transferring;
+                self.markTransferProgress();
                 return;
             }
 
@@ -833,6 +862,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
 
             self.stor_transfer.chunk_len = n;
             self.stor_transfer.chunk_off = 0;
+            self.markTransferProgress();
             try self.flushStorChunk();
         }
 
@@ -854,6 +884,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
                 return;
             }
             self.list_transfer.line_off += wrote;
+            self.markTransferProgress();
             if (self.list_transfer.line_off >= self.list_transfer.line_len) {
                 self.list_transfer.line_off = 0;
                 self.list_transfer.line_len = 0;
@@ -863,6 +894,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
         fn finishListTransfer(self: *Self) interfaces_net.NetError!void {
             self.closeListIter();
             self.list_transfer.reset();
+            self.session.transfer_last_progress_ms = null;
             self.closePassiveResources();
             try self.queueLine(226, "Directory send OK");
         }
@@ -887,6 +919,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
             }
 
             self.retr_transfer.chunk_off += wrote;
+            self.markTransferProgress();
             if (self.retr_transfer.chunk_off >= self.retr_transfer.chunk_len) {
                 self.retr_transfer.chunk_off = 0;
                 self.retr_transfer.chunk_len = 0;
@@ -896,6 +929,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
         fn finishRetrTransfer(self: *Self) interfaces_net.NetError!void {
             self.closeFileReader();
             self.retr_transfer.reset();
+            self.session.transfer_last_progress_ms = null;
             self.closePassiveResources();
             try self.queueLine(226, "Closing data connection");
         }
@@ -917,6 +951,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
             }
 
             self.stor_transfer.chunk_off += wrote;
+            self.markTransferProgress();
             if (self.stor_transfer.chunk_off >= self.stor_transfer.chunk_len) {
                 self.stor_transfer.chunk_off = 0;
                 self.stor_transfer.chunk_len = 0;
@@ -926,6 +961,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
         fn finishStorTransfer(self: *Self) interfaces_net.NetError!void {
             self.closeFileWriter();
             self.stor_transfer.reset();
+            self.session.transfer_last_progress_ms = null;
             self.closePassiveResources();
             try self.queueLine(226, "Closing data connection");
         }
@@ -948,6 +984,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
         fn abortListTransfer(self: *Self, code: u16, text: []const u8) interfaces_net.NetError!void {
             self.closeListIter();
             self.list_transfer.reset();
+            self.session.transfer_last_progress_ms = null;
             self.closePassiveResources();
             try self.queueLine(code, text);
         }
@@ -955,6 +992,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
         fn abortRetrTransfer(self: *Self, code: u16, text: []const u8) interfaces_net.NetError!void {
             self.closeFileReader();
             self.retr_transfer.reset();
+            self.session.transfer_last_progress_ms = null;
             self.closePassiveResources();
             try self.queueLine(code, text);
         }
@@ -962,6 +1000,7 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
         fn abortStorTransfer(self: *Self, code: u16, text: []const u8) interfaces_net.NetError!void {
             self.closeFileWriter();
             self.stor_transfer.reset();
+            self.session.transfer_last_progress_ms = null;
             self.closePassiveResources();
             try self.queueLine(code, text);
         }
@@ -989,6 +1028,72 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
             };
         }
 
+        fn validatePathArg(self: *Self, path: []const u8) interfaces_net.NetError!bool {
+            if (path.len > self.session.rename_from.len) {
+                try self.queueLine(553, "Requested action not taken. File name not allowed");
+                return false;
+            }
+            if (std.mem.indexOfScalar(u8, path, 0) != null) {
+                try self.queueLine(553, "Requested action not taken. File name not allowed");
+                return false;
+            }
+            return true;
+        }
+
+        fn markControlActivity(self: *Self) void {
+            self.session.control_last_activity_ms = self.now_millis;
+        }
+
+        fn markTransferProgress(self: *Self) void {
+            self.session.transfer_last_progress_ms = self.now_millis;
+        }
+
+        fn elapsedAtLeast(self: *Self, start_ms: u64, timeout_ms: u64) bool {
+            if (self.now_millis < start_ms) return false;
+            return self.now_millis - start_ms >= timeout_ms;
+        }
+
+        fn enforceTimeouts(self: *Self) void {
+            const cfg = self.config.timeouts orelse return;
+
+            if (cfg.control_idle_ms) |timeout_ms| {
+                if (self.control_conn != null) {
+                    if (self.session.control_last_activity_ms) |start| {
+                        if (self.elapsedAtLeast(start, timeout_ms)) {
+                            self.closeControlConn();
+                            return;
+                        }
+                    }
+                }
+            }
+
+            if (cfg.pasv_idle_ms) |timeout_ms| {
+                if (self.session.pasv_state == .PasvListening) {
+                    if (self.session.pasv_opened_ms) |start| {
+                        if (self.elapsedAtLeast(start, timeout_ms)) {
+                            self.closePassiveResources();
+                        }
+                    }
+                }
+            }
+
+            if (cfg.transfer_idle_ms) |timeout_ms| {
+                if (self.session.pasv_state == .Transferring) {
+                    if (self.session.transfer_last_progress_ms) |start| {
+                        if (self.elapsedAtLeast(start, timeout_ms)) {
+                            if (self.list_transfer.state == .list_streaming) {
+                                _ = self.abortListTransfer(426, "Connection closed; transfer aborted") catch {};
+                            } else if (self.retr_transfer.state == .retr_streaming) {
+                                _ = self.abortRetrTransfer(426, "Connection closed; transfer aborted") catch {};
+                            } else if (self.stor_transfer.state == .stor_streaming) {
+                                _ = self.abortStorTransfer(426, "Connection closed; transfer aborted") catch {};
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         fn closePassiveResources(self: *Self) void {
             if (self.data_conn) |*conn| {
                 self.net.closeConn(conn);
@@ -1000,6 +1105,8 @@ pub fn FtpServer(comptime Net: type, comptime Fs: type) type {
             }
             self.pasv_listener = null;
             self.session.pasv_state = .PasvIdle;
+            self.session.pasv_opened_ms = null;
+            self.session.transfer_last_progress_ms = null;
         }
 
         fn closeListIter(self: *Self) void {
@@ -1878,4 +1985,167 @@ test "server TYPE A returns matching reply text" {
     }
 
     try testing.expect(std.mem.indexOf(u8, net.written(), "200 Type set to A\r\n") != null);
+}
+
+test "server closes idle control connection when configured" {
+    var net: mock_net.MockNet = .{
+        .control_accept_script = &.{
+            .{ .conn = 1 },
+        },
+    };
+    var fs: MockFs = .{};
+    const listener = try net.controlListen(.{});
+
+    var cmd_buf: [limits.command_max]u8 = undefined;
+    var reply_buf: [limits.reply_max]u8 = undefined;
+    var transfer_buf: [limits.transfer_max]u8 = undefined;
+    var scratch_buf: [limits.scratch_max]u8 = undefined;
+    var storage = misc.Storage.init(cmd_buf[0..], reply_buf[0..], transfer_buf[0..], scratch_buf[0..]);
+    storage.session = .{};
+
+    const Server = FtpServer(mock_net.MockNet, MockFs);
+    var server = Server.initNoHeap(&net, &fs, listener, .{
+        .user = "test",
+        .password = "secret",
+        .timeouts = .{
+            .control_idle_ms = 50,
+        },
+    }, &storage);
+
+    try server.tick(0);
+    try server.tick(10);
+    try server.tick(61);
+
+    try testing.expectEqual(@as(usize, 1), net.closed_conn_len);
+    try testing.expectEqual(@as(u16, 1), net.closed_conn_ids[0]);
+}
+
+test "server closes PASV listener after idle timeout" {
+    var net: mock_net.MockNet = .{
+        .control_accept_script = &.{
+            .{ .conn = 1 },
+        },
+        .read_script = &.{
+            .{ .bytes = "USER test\r\nPASS secret\r\nPASV\r\n" },
+        },
+    };
+    var fs: MockFs = .{};
+    const listener = try net.controlListen(.{});
+
+    var cmd_buf: [limits.command_max]u8 = undefined;
+    var reply_buf: [limits.reply_max]u8 = undefined;
+    var transfer_buf: [limits.transfer_max]u8 = undefined;
+    var scratch_buf: [limits.scratch_max]u8 = undefined;
+    var storage = misc.Storage.init(cmd_buf[0..], reply_buf[0..], transfer_buf[0..], scratch_buf[0..]);
+    storage.session = .{};
+
+    const Server = FtpServer(mock_net.MockNet, MockFs);
+    var server = Server.initNoHeap(&net, &fs, listener, .{
+        .user = "test",
+        .password = "secret",
+        .timeouts = .{
+            .pasv_idle_ms = 30,
+        },
+    }, &storage);
+
+    var now: u64 = 0;
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        try server.tick(now);
+        now += 10;
+    }
+
+    try testing.expectEqual(@as(usize, 1), net.closed_listener_len);
+    try testing.expect(std.mem.indexOf(u8, net.written(), "227 Entering Passive Mode") != null);
+}
+
+test "server aborts stalled transfer after idle timeout" {
+    var net: mock_net.MockNet = .{
+        .control_accept_script = &.{
+            .{ .conn = 1 },
+        },
+        .data_accept_script = &.{
+            .{ .conn = 9 },
+        },
+        .write_script = &.{
+            .{ .accept = 1024 }, // 220
+            .{ .accept = 1024 }, // 331
+            .{ .accept = 1024 }, // 230
+            .{ .accept = 1024 }, // 227
+            .{ .accept = 1024 }, // 150
+            .would_block,
+            .would_block,
+            .would_block,
+            .would_block,
+            .would_block,
+            .{ .accept = 1024 }, // 426
+        },
+        .read_script = &.{
+            .{ .bytes = "USER test\r\nPASS secret\r\nPASV\r\nLIST\r\n" },
+        },
+    };
+    var fs: MockFs = .{};
+    const listener = try net.controlListen(.{});
+
+    var cmd_buf: [limits.command_max]u8 = undefined;
+    var reply_buf: [limits.reply_max]u8 = undefined;
+    var transfer_buf: [limits.transfer_max]u8 = undefined;
+    var scratch_buf: [limits.scratch_max]u8 = undefined;
+    var storage = misc.Storage.init(cmd_buf[0..], reply_buf[0..], transfer_buf[0..], scratch_buf[0..]);
+    storage.session = .{};
+
+    const Server = FtpServer(mock_net.MockNet, MockFs);
+    var server = Server.initNoHeap(&net, &fs, listener, .{
+        .user = "test",
+        .password = "secret",
+        .timeouts = .{
+            .transfer_idle_ms = 40,
+        },
+    }, &storage);
+
+    var now: u64 = 0;
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        try server.tick(now);
+        now += 10;
+    }
+
+    const written = net.written();
+    try testing.expect(std.mem.indexOf(u8, written, "150 Here comes the directory listing\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "426 Connection closed; transfer aborted\r\n") != null);
+    try testing.expectEqual(@as(u16, 9), net.closed_conn_ids[0]);
+}
+
+test "server rejects overlong path arguments in core" {
+    const long_path = "a" ** (limits.path_max + 1);
+    var net: mock_net.MockNet = .{
+        .control_accept_script = &.{
+            .{ .conn = 1 },
+        },
+        .read_script = &.{
+            .{ .bytes = "USER test\r\nPASS secret\r\nDELE " ++ long_path ++ "\r\nQUIT\r\n" },
+        },
+    };
+    var fs: MockFs = .{};
+    const listener = try net.controlListen(.{});
+
+    var cmd_buf: [limits.command_max]u8 = undefined;
+    var reply_buf: [limits.reply_max]u8 = undefined;
+    var transfer_buf: [limits.transfer_max]u8 = undefined;
+    var scratch_buf: [limits.scratch_max]u8 = undefined;
+    var storage = misc.Storage.init(cmd_buf[0..], reply_buf[0..], transfer_buf[0..], scratch_buf[0..]);
+    storage.session = .{};
+
+    const Server = FtpServer(mock_net.MockNet, MockFs);
+    var server = Server.initNoHeap(&net, &fs, listener, .{
+        .user = "test",
+        .password = "secret",
+    }, &storage);
+
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        try server.tick(0);
+    }
+
+    try testing.expect(std.mem.indexOf(u8, net.written(), "553 Requested action not taken. File name not allowed\r\n") != null);
 }

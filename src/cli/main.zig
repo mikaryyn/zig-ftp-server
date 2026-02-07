@@ -15,6 +15,9 @@ pub fn main(init: std.process.Init) !void {
     var root_path: []const u8 = ".";
     var user: []const u8 = "test";
     var pass: []const u8 = "test";
+    var control_idle_ms: ?u64 = null;
+    var pasv_idle_ms: ?u64 = null;
+    var transfer_idle_ms: ?u64 = null;
 
     while (args_it.next()) |arg_z| {
         const arg = arg_z[0..arg_z.len];
@@ -49,6 +52,27 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "--help")) {
             try usageAndExit();
         }
+        if (std.mem.eql(u8, arg, "--control-idle-ms")) {
+            const next = args_it.next() orelse {
+                try usageAndExit();
+            };
+            control_idle_ms = std.fmt.parseInt(u64, next[0..next.len], 10) catch return error.InvalidArgs;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--pasv-idle-ms")) {
+            const next = args_it.next() orelse {
+                try usageAndExit();
+            };
+            pasv_idle_ms = std.fmt.parseInt(u64, next[0..next.len], 10) catch return error.InvalidArgs;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--transfer-idle-ms")) {
+            const next = args_it.next() orelse {
+                try usageAndExit();
+            };
+            transfer_idle_ms = std.fmt.parseInt(u64, next[0..next.len], 10) catch return error.InvalidArgs;
+            continue;
+        }
         std.log.err("Unknown argument: {s}", .{arg});
         try usageAndExit();
     }
@@ -76,12 +100,21 @@ pub fn main(init: std.process.Init) !void {
         scratch_buf[0..],
     );
     var timer = std.time.Timer.start() catch return error.TimerUnsupported;
+    const timeout_cfg: ?ftp.misc.Timeouts = if (control_idle_ms != null or pasv_idle_ms != null or transfer_idle_ms != null)
+        .{
+            .control_idle_ms = control_idle_ms,
+            .pasv_idle_ms = pasv_idle_ms,
+            .transfer_idle_ms = transfer_idle_ms,
+        }
+    else
+        null;
 
     const Server = ftp.server.FtpServer(net_std.NetStd, vfs_os.VfsOs);
     var server = Server.initNoHeap(&net_impl, &fs_impl, listener, .{
         .user = user,
         .password = pass,
         .banner = "FTP Server Ready",
+        .timeouts = timeout_cfg,
     }, &storage);
 
     std.log.info("Listening on {s} (root={s}, user={s})", .{ listen_addr, root_path, user });
@@ -103,6 +136,7 @@ pub fn main(init: std.process.Init) !void {
 fn usageAndExit() !noreturn {
     std.debug.print(
         "Usage: ftp-server [--listen <ip:port>] [--root <path>] [--user <name>] [--pass <pass>]\n" ++
+            "                 [--control-idle-ms <ms>] [--pasv-idle-ms <ms>] [--transfer-idle-ms <ms>]\n" ++
             "Example: ftp-server --listen 127.0.0.1:2121 --root /tmp/ftp-root --user test --pass test\n",
         .{},
     );

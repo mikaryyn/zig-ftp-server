@@ -20,6 +20,9 @@ pub const Session = struct {
     transfer_type: TransferType = .binary,
     cwd_ready: bool = false,
     pasv_state: pasv.State = .PasvIdle,
+    control_last_activity_ms: ?u64 = null,
+    pasv_opened_ms: ?u64 = null,
+    transfer_last_progress_ms: ?u64 = null,
     rename_from_len: usize = 0,
-    rename_from: [limits.command_max]u8 = [_]u8{0} ** limits.command_max,
+    rename_from: [limits.path_max]u8 = [_]u8{0} ** limits.path_max,
 };
