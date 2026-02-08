@@ -1,34 +1,100 @@
 # zig-ftp-server
 
-A small, embeddable FTP **server** library written in Zig. The library is single-threaded and progresses via a cooperative `tick()` loop with non-blocking I/O. It supports one control session at a time, a single configured user, and passive-mode-only (`PASV`) data connections. The long-term goal is a basic but practically usable FTP server with streaming transfers and small fixed buffers.
+Small FTP server library and CLI runner in Zig 0.16.
 
-See the design plan at `docs/ftp_server_plan.md` and the protocol/spec details at `docs/ftp_server_spec.md`.
+The server is single-threaded, non-blocking, and advances via `tick(now_millis)`. It supports one configured user, one control session at a time, and passive mode (`PASV`) data transfers.
 
 ## Requirements
 
-- Zig 0.16 (the project targets Zig 0.16 APIs).
+- Zig toolchain at `~/zig/zig`
 
-## Tests
-
-Run unit tests from the repo root:
+## Build and test
 
 ```sh
-zig build test
+~/zig/zig build test
+~/zig/zig build
 ```
 
-## CLI App
+## Naming conventions (Zig)
 
-The CLI harness (used as a runnable demo and smoke-test) is planned for Milestone 5 and is not yet present in this repository. Once implemented, it will build an `ftp-server` executable and support a command line like:
+Use `lowerCamelCase` for all functions, except functions that return a type (Zig), which use `PascalCase`.
+
+## Run the CLI harness
 
 ```sh
-zig build
-zig build run -- --listen 127.0.0.1:2121 --root /tmp/ftp-root --user test --pass test
+mkdir -p /tmp/ftp-root
+~/zig/zig build run -- --listen 127.0.0.1:2121 --root /tmp/ftp-root --user test --pass test
 ```
 
-Example manual smoke test (once the CLI exists):
+CLI flags:
 
-```sh
-printf "USER test\r\nPASS test\r\nPWD\r\nQUIT\r\n" | nc 127.0.0.1 2121
+- `--listen <ip:port>` (default: `127.0.0.1:2121`)
+- `--root <path>` (default: `.`)
+- `--user <name>` (default: `test`)
+- `--pass <pass>` (default: `test`)
+- `--control-idle-ms <ms>` (optional)
+- `--pasv-idle-ms <ms>` (optional)
+- `--transfer-idle-ms <ms>` (optional)
+
+## Supported commands
+
+- Authentication/session: `USER`, `PASS`, `QUIT`, `NOOP`
+- Basic interop: `SYST`, `TYPE`, `FEAT`
+- Navigation: `PWD`, `CWD`, `CDUP`
+- Passive and transfers: `PASV`, `LIST`, `RETR`, `STOR`
+- File ops: `DELE`, `RNFR`, `RNTO`
+- Optional implemented commands: `MKD`, `RMD`, `SIZE`, `MDTM`
+- Unsupported commands return `502` (for example `PORT`)
+
+## Limitations
+
+- Single control session at a time; extra concurrent control connections are rejected with `421`.
+- PASV-only data mode; active mode (`PORT`, `EPRT`) is not implemented.
+- IPv4 PASV reply format (`227 (h1,h2,h3,h4,p1,p2)`) only.
+- No TLS/FTPS.
+- No resume support (`REST`) or advanced RFC extensions.
+
+## Implementing custom Net/Fs backends
+
+This library uses compile-time checked interfaces defined in:
+
+- `src/ftp/interfaces_net.zig`
+- `src/ftp/interfaces_fs.zig`
+
+Instantiate the server with:
+
+```zig
+const Server = ftp.server.FtpServer(MyNet, MyFs);
 ```
 
-If you need the CLI sooner, I can implement Milestone 5 after the control-channel and state machine milestones are complete.
+If required declarations are missing, the comptime validators emit actionable compile errors.
+
+### `tick()` guarantees and expectations
+
+`tick(now_millis)` is cooperative and must not block. One tick performs bounded work:
+
+- Accept primary control connection when idle.
+- Reject extra control connections with `421` when a session is active.
+- Flush pending control replies with partial-write resume.
+- Progress PASV accept and active transfer state (`LIST`/`RETR`/`STOR`).
+- Parse and process at most one command line per tick.
+
+`Net` and `Fs` backends should therefore support incremental progress:
+
+- Return `error.WouldBlock` when an operation cannot proceed immediately.
+- Allow short reads/writes; the core resumes using tracked offsets.
+- Keep close operations idempotent and safe to call during cleanup paths.
+
+### Notes for `Net` implementers
+
+- Provide control listen/accept/read/write/close operations.
+- Provide PASV listen/accept/read/write/close operations.
+- Surface transport failures through `interfaces_net.NetError`.
+- For PASV, expose a listener address so the server can format `227 (h1,h2,h3,h4,p1,p2)`.
+
+### Notes for `Fs` implementers
+
+- Implement cwd lifecycle (`cwdInit`, `cwdPwd`, `cwdChange`, `cwdUp`).
+- Implement transfer/file primitives used by `LIST`, `RETR`, `STOR`, `DELE`, and rename.
+- Reject invalid paths robustly (including NUL bytes and root escapes for OS-backed VFS).
+- Map backend errors to the defined `FsError` set so reply mapping stays deterministic.
